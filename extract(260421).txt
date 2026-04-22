@@ -1,0 +1,517 @@
+# -*- coding: utf-8 -*-
+# FINAL OPTIMIZED VERSION
+# LOGIC PRESERVED + SMALL BOM RESCUE MODE (REFINED)
+
+from pyautocad import Autocad
+import pandas as pd
+import re
+import os
+import time
+from datetime import datetime
+
+acad = Autocad(create_if_not_exists=True)
+
+HAS_ALPHA = re.compile(r'[A-Za-z]')
+HAS_KR = re.compile(r'[\uAC00-\uD7A3]')
+MAKER_PATTERN = re.compile(r'.+\([A-Z]{2}\)')
+KEYWORDS = ["ITEM", "PART", "QTY", "품명", "품번", "수량"]
+
+REFERENCE_TOKEN_PATTERN = re.compile(
+    r'^(?:R|C|U|L|D|Q|J|P|CN|IC|TP)\d+[A-Z]?$',
+    re.IGNORECASE
+)
+
+TOKEN_CACHE = {}
+
+def fast_has_alpha(t):
+    if t in TOKEN_CACHE:
+        return TOKEN_CACHE[t]
+    res = bool(HAS_ALPHA.search(t) or HAS_KR.search(t))
+    TOKEN_CACHE[t] = res
+    return res
+
+REFERENCE_LIST_PATTERN = re.compile(
+    r'^(?:\s*(?:R|C|U|L|D|Q|J|P|CN|IC|TP)\d+[A-Z]?\s*)(?:,\s*(?:R|C|U|L|D|Q|J|P|CN|IC|TP)\d+[A-Z]?\s*)+$',
+    re.IGNORECASE
+)
+
+# rescue mode precision filter keywords
+RESCUE_BLOCKED_PATTERNS = [
+    "REF.DES", "REF DES", "FIX", "PARTTYPE", "PART TYPE",
+    "PAD", "TYPE", "NO.", "FILTER", "RD5RD960B"
+]
+
+def is_valid_drawing(file_name):
+    name = os.path.splitext(file_name)[0].upper()
+    if "-" not in name:
+        return True
+    try:
+        suffix = name.split("-")[-1]
+    except:
+        return False
+    digits = re.sub(r'[^0-9]', '', suffix)
+    if len(digits) < 4:
+        return True
+    return (int(digits[0:2]) <= 1) and (int(digits[2:4]) <= 20)
+
+def norm(t):
+    if t is None:
+        return ""
+    return str(t).encode("utf-8", "ignore").decode("utf-8").replace("\n", " ").strip()
+
+def is_part_code(token):
+    if token.isdigit() and len(token) >= 4:
+        return True
+    if re.match(r'^[0-9]+-[0-9A-Za-z\-]+$', token):
+        return True
+    if HAS_ALPHA.search(token) and len(token) >= 4:
+        return True
+    return False
+
+def is_reference_designator(token):
+    t = norm(token)
+    if not t:
+        return False
+    if REFERENCE_TOKEN_PATTERN.match(t):
+        return True
+    if REFERENCE_LIST_PATTERN.match(t):
+        return True
+    return False
+
+def is_rescue_blocked_token(token):
+    t = norm(token).upper()
+    if not t:
+        return True
+    for pat in RESCUE_BLOCKED_PATTERNS:
+        if pat in t:
+            return True
+    return False
+
+def is_strong_part_code(token):
+    t = norm(token).upper()
+    if not t:
+        return False
+    if is_rescue_blocked_token(t):
+        return False
+    if is_reference_designator(t):
+        return False
+    if t == "000000":
+        return False
+    if len(t) < 5:
+        return False
+
+    has_alpha = bool(re.search(r'[A-Z]', t))
+    has_digit = bool(re.search(r'\d', t))
+
+    # pure text like FIX1 / PAD / PARTTYPE should be excluded by blocked filter
+    # pure digits are excluded
+    if not has_alpha and not has_digit:
+        return False
+    if has_alpha and not has_digit:
+        return False
+    if has_digit and not has_alpha:
+        return False
+
+    return is_part_code(t)
+
+def com_retry(func, retries=5, delay=0.2):
+    for _ in range(retries):
+        try:
+            return func()
+        except:
+            time.sleep(delay)
+    return None
+
+def open_dwg_safe(file_path):
+    return com_retry(lambda: acad.app.Documents.Open(file_path))
+
+def close_doc_safe(doc):
+    com_retry(lambda: doc.Close(False))
+
+def safe_iter(ms):
+    try:
+        count = ms.Count
+    except:
+        return []
+    for i in range(count):
+        try:
+            yield ms.Item(i)
+        except:
+            continue
+
+def read_text_safe(doc):
+    drawing_name = doc.Name
+    ms = com_retry(lambda: doc.ModelSpace)
+    if ms is None:
+        return pd.DataFrame()
+
+    rows = []
+    y_candidates = []
+
+    for obj in safe_iter(ms):
+        try:
+            if obj.ObjectName not in ["AcDbText", "AcDbMText"]:
+                continue
+
+            txt = norm(obj.TextString if obj.ObjectName == "AcDbText" else obj.Text)
+            if not txt:
+                continue
+            if len(txt) <= 1:
+                continue
+
+            txt_u = txt.upper()
+            x, y, _ = obj.InsertionPoint
+            y = float(y)
+
+            if ("ITEM" in txt_u or "PART" in txt_u or "QTY" in txt_u or
+                "품명" in txt_u or "품번" in txt_u or "수량" in txt_u):
+                y_candidates.append(y)
+
+            rows.append({
+                "DRAWING_FILE": drawing_name,
+                "X": float(x),
+                "Y": y,
+                "TEXT": txt
+            })
+
+        except:
+            continue
+
+    if not rows:
+        return pd.DataFrame()
+
+    df = pd.DataFrame(rows)
+
+    if y_candidates:
+        y_max = max(y_candidates) + 10
+        y_min = min(y_candidates) - 200
+        df = df[(df["Y"] <= y_max) & (df["Y"] >= y_min)]
+
+    return df
+
+def build_rows(df, tol=1.0):
+    # 🔥 vectorized grouping (same logic)
+    if df.empty:
+        return []
+    d = df.sort_values(["Y", "X"], ascending=[False, True]).reset_index(drop=True)
+    dy = d["Y"].diff().abs().fillna(0)
+    grp = (dy > tol).cumsum()
+    return [g.to_dict("records") for _, g in d.groupby(grp)]
+
+def split_row_by_x(row, gap=60):
+    if len(row) < 3:
+        return [row]
+
+    row = sorted(row, key=lambda r: r["X"])
+    groups = []
+    cur = []
+    last = None
+
+    for r in row:
+        if last is None or abs(r["X"] - last) <= gap:
+            cur.append(r)
+        else:
+            groups.append(cur)
+            cur = [r]
+        last = r["X"]
+
+    if cur:
+        groups.append(cur)
+    return groups
+
+def get_root_part_from_drawing(drawing_file):
+    base = os.path.splitext(os.path.basename(str(drawing_file)))[0].upper()
+    first = base.split("-")[0].strip()
+    return first if first else base
+
+def choose_best_part_no(tokens, maker):
+    candidates = []
+    for idx, t in enumerate(tokens):
+        if t == maker:
+            continue
+        if is_part_code(t):
+            score = len(t) + idx
+            candidates.append((score, t))
+    if not candidates:
+        return ""
+    candidates.sort(reverse=True)
+    return candidates[0][1]
+
+def is_bom_like_group(tokens):
+    if not tokens:
+        return False
+
+    item_like = 0
+    part_like = 0
+    maker_like = 0
+    meaningful_text = 0
+    digit_cnt = 0
+    ref_cnt = 0
+
+    for t in tokens:
+        if not t:
+            continue
+
+        if t.isdigit():
+            digit_cnt += 1
+            if len(t) <= 3:
+                item_like += 1
+            continue
+
+        if MAKER_PATTERN.match(t):
+            maker_like += 1
+            continue
+
+        if is_reference_designator(t):
+            ref_cnt += 1
+            continue
+
+        if is_part_code(t):
+            part_like += 1
+            continue
+
+        if HAS_ALPHA.search(t) or HAS_KR.search(t):
+            meaningful_text += 1
+
+    total = len(tokens)
+
+    if total > 8 and (digit_cnt + ref_cnt) / total >= 0.8 and meaningful_text == 0 and maker_like == 0:
+        return False
+
+    score = 0
+    if item_like >= 1:
+        score += 2
+    if part_like >= 1:
+        score += 2
+    if maker_like >= 1:
+        score += 1
+    if meaningful_text >= 1:
+        score += 1
+
+    return score >= 4
+
+def parse_group(group):
+    g = sorted(group, key=lambda x: x["X"])
+    tokens = [r["TEXT"] for r in g]
+    drawing_name = g[0]["DRAWING_FILE"]
+
+    digit_cnt = sum(1 for t in tokens if t.isdigit())
+    alpha_cnt = sum(1 for t in tokens if fast_has_alpha(t))
+    if len(tokens) > 5 and digit_cnt > len(tokens) * 0.6 and alpha_cnt == 0:
+        return None
+
+    maker = ""
+    item = ""
+    qty_candidates = []
+    name_tokens = []
+
+    for t in tokens:
+        if MAKER_PATTERN.match(t):
+            maker = t
+        elif t.isdigit() and len(t) <= 3:
+            if not item:
+                item = t
+            else:
+                qty_candidates.append(t)
+        elif not is_part_code(t):
+            name_tokens.append(t)
+
+    part_no = choose_best_part_no(tokens, maker)
+
+    if is_reference_designator(part_no):
+        part_no = ""
+
+    name = " ".join(name_tokens).strip()
+    qty = qty_candidates[-1] if qty_candidates else "1"
+
+    if not item or not part_no:
+        return None
+
+    digit_tokens = sum(1 for t in tokens if t.isdigit())
+    ref_tokens = sum(1 for t in tokens if is_reference_designator(t))
+    text_tokens = sum(1 for t in tokens if fast_has_alpha(t))
+
+    if len(tokens) > 10 and (digit_tokens + ref_tokens) / max(len(tokens),1) > 0.85 and text_tokens == 0:
+        return None
+
+    return {
+        "DRAWING_FILE": drawing_name,
+        "ITEM_NO": item,
+        "PART_NAME": name,
+        "QTY": qty,
+        "PART_NO": part_no,
+        "MAKER": maker
+    }
+
+# =========================
+# SMALL BOM RESCUE MODE (REFINED)
+# =========================
+def rescue_small_bom(groups):
+    rescued = []
+
+    for g in groups:
+        raw_tokens = [r["TEXT"] for r in g]
+        tokens = [norm(t) for t in raw_tokens if norm(t)]
+
+        if not tokens:
+            continue
+
+        # blocked attribute-like groups are removed first
+        if any(is_rescue_blocked_token(t) for t in tokens):
+            continue
+
+        part_candidates = []
+        for t in tokens:
+            if is_strong_part_code(t):
+                part_candidates.append(t)
+
+        # must have at least one strong part code candidate
+        if len(part_candidates) < 1:
+            continue
+
+        # maker/text candidates, but remove blocked and part-like text
+        maker = ""
+        name_tokens = []
+        for t in tokens:
+            if is_rescue_blocked_token(t):
+                continue
+            if MAKER_PATTERN.match(t):
+                maker = t
+                continue
+            if is_strong_part_code(t):
+                continue
+            if is_reference_designator(t):
+                continue
+            if fast_has_alpha(t):
+                name_tokens.append(t)
+
+        # rescue must look like a real bom row, not a property row
+        if not name_tokens and not maker:
+            continue
+
+        part_no = part_candidates[0]
+        part_name = " ".join(name_tokens).strip()
+
+        rescued.append({
+            "DRAWING_FILE": g[0]["DRAWING_FILE"],
+            "ITEM_NO": "",
+            "PART_NAME": part_name,
+            "QTY": "1",
+            "PART_NO": part_no,
+            "MAKER": maker
+        })
+
+    # keep only unique part numbers
+    uniq_rows = []
+    seen = set()
+    for r in rescued:
+        p = r["PART_NO"]
+        if not p or p in seen:
+            continue
+        seen.add(p)
+        uniq_rows.append(r)
+
+    # file-level rescue is accepted only when 2+ distinct part numbers exist
+    if len(seen) >= 2:
+        return uniq_rows
+
+    return []
+
+def build_real_tree(df):
+    rows = []
+    for drawing, g in df.groupby("DRAWING_FILE"):
+        root = get_root_part_from_drawing(drawing)
+        rows.append({
+            "LEVEL": 0,
+            "ROOT_DRAWING": drawing,
+            "PARENT_PART": "",
+            "CHILD_PART": root
+        })
+        for _, r in g.iterrows():
+            if r["PART_NO"] and r["PART_NO"] != root:
+                rows.append({
+                    "LEVEL": 1,
+                    "ROOT_DRAWING": drawing,
+                    "PARENT_PART": root,
+                    "CHILD_PART": r["PART_NO"]
+                })
+    return pd.DataFrame(rows)
+
+def main():
+    folder = input("DWG 폴더 경로 입력: ").strip()
+    all_rows = []
+
+    files = [
+        f for f in os.listdir(folder)
+        if f.lower().endswith(".dwg") and is_valid_drawing(f)
+    ]
+
+    for f in files:
+        path = os.path.join(folder, f)
+        print("[INFO]", f)
+
+        temp_rows = []
+        all_groups = []  # rescue용
+
+        doc = open_dwg_safe(path)
+        if doc is None:
+            continue
+
+        df = read_text_safe(doc)
+        close_doc_safe(doc)
+
+        if df.empty:
+            continue
+
+        # 🔥 header Y positions (from df, no extra scan)
+        header_ys = df[df["TEXT"].str.upper().str.contains("ITEM|PART|QTY|품명|품번|수량", na=False)]["Y"].tolist()
+
+
+        for row in build_rows(df):
+            if len(row) < 2:
+                continue
+
+            # 🔥 conditional split (no logic change)
+            xs = [r["X"] for r in row]
+            groups_iter = [row] if (len(row) < 4 or (max(xs)-min(xs) < 120)) else split_row_by_x(row)
+
+            for g in groups_iter:
+                all_groups.append(g)
+
+                tokens = [r["TEXT"] for r in g]
+
+                if not is_bom_like_group(tokens):
+                    continue
+
+                p = parse_group(g)
+                if p:
+                    temp_rows.append(p)
+
+        # 🔥 always run rescue and merge (keep existing + add missing)
+        rescued = rescue_small_bom(all_groups)
+        if rescued:
+            existing = set(r.get("PART_NO","") for r in temp_rows)
+            temp_rows.extend([r for r in rescued if r.get("PART_NO","") and r.get("PART_NO","") not in existing])
+
+        all_rows.extend(temp_rows)
+
+    df = pd.DataFrame(all_rows)
+
+    if df.empty:
+        df = pd.DataFrame(columns=["DRAWING_FILE", "ITEM_NO", "PART_NAME", "QTY", "PART_NO", "MAKER"])
+
+    df["ITEM_NO_NUM"] = pd.to_numeric(df["ITEM_NO"], errors="coerce")
+    df = df.sort_values(["DRAWING_FILE", "ITEM_NO_NUM"]).drop(columns=["ITEM_NO_NUM"])
+
+    df_tree = build_real_tree(df)
+
+    file = f"bom_FINAL_REFINED_RESCUE_{datetime.now().strftime('%H%M%S')}.xlsx"
+
+    with pd.ExcelWriter(file) as writer:
+        df.to_excel(writer, sheet_name="BOM_RAW", index=False)
+        df_tree.to_excel(writer, sheet_name="BOM_TREE", index=False)
+
+    print("DONE", file)
+
+if __name__ == "__main__":
+    main()
