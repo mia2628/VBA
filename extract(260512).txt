@@ -1,0 +1,3668 @@
+# -*- coding: utf-8 -*-
+"""
+IPS/LSA BOM Automation - Clean Restart Step 6
+
+Goal of this version
+--------------------
+Step 1~6:
+1) Extract TEXT_OBJECT_RAW from DWG/PDF drawings.
+2) Rebuild ROW_CANDIDATES from raw text coordinates.
+3) Detect first-pass BOM_ZONE_CANDIDATES from BOM header anchors.
+4) Expand headerless 2nd/3rd BOM table zones using row-pattern clusters.
+5) Add IS_IN_BOM_ZONE columns to ROW_CANDIDATES.
+6) Export diagnostic Excel.
+7) Add BOM_ZONE validation sheets for debugging.
+8) Reintroduce BOM_TRUE / BOM_REVIEW / BOM_FALSE using IS_IN_BOM_ZONE positive gating.
+9) Parse BOM_TRUE_ROWS into BOM_RAW columns.
+10) Build PART_MASTER from BOM_RAW by PART_NO.
+
+This version intentionally does NOT create:
+- BOM_TRUE_ROWS
+- BOM_FALSE_ROWS
+- PART_MASTER
+
+Next development steps
+----------------------
+Step 2: Headerless BOM zone extension for 2nd/3rd BOM tables.  # included in this version
+Step 3: BOM zone diagnostics and outside-zone review sheets.  # included in this version.
+Step 4: BOM_TRUE/BOM_FALSE reintroduction with IS_IN_BOM_ZONE positive gating.  # included in this version.
+Step 5: BOM_RAW column parsing and normalization.  # included in this version.
+Step 6: PART_MASTER generation by part number.  # included in this version.
+
+Important design rule
+---------------------
+Do not decide final BOM TRUE/FALSE from blacklist strings.
+A row should become a final BOM row only after it is inside a confirmed BOM_ZONE.
+"""
+
+import os
+import re
+import sys
+import math
+import time
+import traceback
+from pathlib import Path
+from datetime import datetime
+
+import pandas as pd
+
+
+# ============================================================
+# Global settings
+# ============================================================
+
+SUPPORTED_EXTENSIONS = {".dwg", ".pdf"}
+OUTPUT_EXCEL_NAME = "ips_lsa_bom_step6_part_master.xlsx"
+
+# Row grouping / recovery parameters
+ROW_Y_TOLERANCE = 2.5
+ITEM_NO_MIN = 1
+ITEM_NO_MAX = 999
+ITEM_NO_MAX_DIGITS = 3
+ITEM_COLUMN_MIN_UNIQUE_VALUES = 3
+ITEM_COLUMN_MIN_SPAN = 3
+
+ROWSPAN_MIN_DETAIL_LINES = 2
+ROWSPAN_VERTICAL_SEARCH_MULTIPLIER = 12.0
+ORPHAN_DETAIL_MIN_SCORE = 55
+
+# BOM zone parameters
+BOM_HEADER_KEYWORDS = {"품번", "품명", "수량", "부품번호", "도면번호"}
+BOM_HEADER_ALIASES = {
+    "순번", "품목", "품목번호", "품번", "품명", "수량",
+    "부품번호", "도면번호", "제조사", "MAKER"
+}
+BOM_ZONE_MIN_CONFIDENCE = 55
+BOM_ZONE_X_MARGIN = 8.0
+BOM_ZONE_HEADER_Y_MARGIN_MULTIPLIER = 1.5
+BOM_ZONE_MAX_VERTICAL_SPAN_MULTIPLIER = 80.0
+
+# Headerless BOM zone extension parameters
+HEADERLESS_ZONE_MIN_ROW_COUNT = 3
+HEADERLESS_ZONE_MIN_CONFIDENCE = 50
+HEADERLESS_ZONE_X_CLUSTER_GAP = 35.0
+HEADERLESS_ZONE_Y_OVERLAP_RATIO_MIN = 0.20
+HEADERLESS_ZONE_REFERENCE_Y_MARGIN_RATIO = 0.35
+HEADERLESS_ZONE_MAX_WIDTH_RATIO = 1.50
+
+
+# ============================================================
+# Common helpers
+# ============================================================
+
+def safe_text(value) -> str:
+    """Return normalized safe text."""
+    if value is None:
+        return ""
+    try:
+        text = str(value)
+    except Exception:
+        return ""
+    text = text.replace("\r", " ").replace("\n", " ").replace("\t", " ")
+    text = re.sub(r"\s+", " ", text)
+    return text.strip()
+
+
+def to_float(value, default=None):
+    try:
+        if value is None:
+            return default
+        value = float(value)
+        if math.isnan(value):
+            return default
+        return value
+    except Exception:
+        return default
+
+
+def looks_like_qty(text: str) -> bool:
+    token = safe_text(text)
+    if not token.isdigit():
+        return False
+    try:
+        value = int(token)
+    except Exception:
+        return False
+    return 0 <= value <= 9999
+
+
+def looks_like_item_no(text: str) -> bool:
+    token = safe_text(text)
+    if not token.isdigit():
+        return False
+    if len(token) > ITEM_NO_MAX_DIGITS:
+        return False
+    try:
+        value = int(token)
+    except Exception:
+        return False
+    return ITEM_NO_MIN <= value <= ITEM_NO_MAX
+
+
+def looks_like_part_no(text: str) -> bool:
+    """
+    Detect part-number-like tokens for row reconstruction only.
+
+    This is not final BOM judgment.
+    """
+    token = safe_text(text).upper()
+    if not token:
+        return False
+    if token.isdigit():
+        return False
+    if len(token) < 4:
+        return False
+
+    has_alpha = any(c.isalpha() for c in token)
+    has_digit = any(c.isdigit() for c in token)
+    if not has_alpha or not has_digit:
+        return False
+
+    # Reject obvious comma-separated refdes lists: R16, R21, R26
+    if "," in token:
+        parts = [p.strip().strip(",").strip(";") for p in token.replace(";", ",").split(",") if p.strip()]
+        if parts and all(re.fullmatch(r"[A-Z]{1,3}\d+[A-Z]?", p) for p in parts):
+            return False
+
+    return bool(re.fullmatch(r"[A-Z0-9][A-Z0-9_\-./]{3,}", token))
+
+
+def looks_like_maker_text(text: str) -> bool:
+    token = safe_text(text)
+    if not token:
+        return False
+
+    upper = token.upper()
+
+    if "(" in token and ")" in token:
+        return True
+
+    maker_keywords = [
+        "KR", "US", "JP", "CN", "DE", "UK", "FR",
+        "SAMSUNG", "MURATA", "TDK", "RFMD", "AVAGO",
+        "TI", "ANALOG", "KEMET", "MAINT", "CO.", "INC"
+    ]
+    return any(k in upper for k in maker_keywords)
+
+
+def detail_group_score(tokens: list) -> tuple:
+    """
+    Score a detail-line group used for rowspan/orphan rescue.
+
+    This helps reconstruct rows. It is not final BOM judgment.
+    """
+    clean = [safe_text(t) for t in tokens if safe_text(t)]
+
+    score = 0
+    reasons = []
+
+    if len(clean) >= 2:
+        score += 15
+        reasons.append("TOKEN_COUNT_GE_2")
+
+    if any(looks_like_qty(t) for t in clean):
+        score += 20
+        reasons.append("QTY_FOUND")
+
+    if any(looks_like_part_no(t) for t in clean):
+        score += 35
+        reasons.append("PART_NO_FOUND")
+
+    if any(looks_like_maker_text(t) for t in clean):
+        score += 20
+        reasons.append("MAKER_FOUND")
+
+    return score, ";".join(reasons)
+
+
+# ============================================================
+# Step 0: File collection
+# ============================================================
+
+def ask_input_folder() -> Path:
+    """
+    Ask target drawing folder from the user.
+    """
+    print("-" * 80)
+    print("IPS/LSA BOM Step 1 - BOM_ZONE Foundation")
+    print("-" * 80)
+    folder_text = input("BOM을 추출할 DWG/PDF 폴더 경로를 입력하세요: ").strip().strip('"')
+    folder = Path(folder_text).expanduser().resolve()
+
+    if not folder.exists() or not folder.is_dir():
+        raise FileNotFoundError(f"Input folder not found: {folder}")
+
+    return folder
+
+
+def collect_drawing_files(input_folder: Path, recursive: bool = False) -> pd.DataFrame:
+    """
+    Collect DWG/PDF drawing files from the selected folder.
+    """
+    pattern = "**/*" if recursive else "*"
+    rows = []
+
+    for path in sorted(input_folder.glob(pattern)):
+        if not path.is_file():
+            continue
+
+        ext = path.suffix.lower()
+        if ext not in SUPPORTED_EXTENSIONS:
+            continue
+
+        rows.append({
+            "DRAWING_FILE": path.name,
+            "FULL_PATH": str(path),
+            "EXTENSION": ext,
+            "FILE_SIZE": path.stat().st_size,
+            "MODIFIED_TIME": datetime.fromtimestamp(path.stat().st_mtime).strftime("%Y-%m-%d %H:%M:%S"),
+        })
+
+    return pd.DataFrame(rows)
+
+
+# ============================================================
+# Step 1: TEXT_OBJECT_RAW extraction
+# ============================================================
+
+def make_text_object_record(
+    drawing_file: str,
+    full_path: str,
+    extension: str,
+    page_or_layout: str,
+    text: str,
+    x=None,
+    y=None,
+    z=None,
+    width=None,
+    height=None,
+    object_type=None,
+    extraction_status: str = "OK",
+    extraction_note: str = "",
+) -> dict:
+    return {
+        "DRAWING_FILE": safe_text(drawing_file),
+        "FULL_PATH": safe_text(full_path),
+        "EXTENSION": safe_text(extension),
+        "PAGE_OR_LAYOUT": safe_text(page_or_layout),
+        "TEXT": safe_text(text),
+        "X": x,
+        "Y": y,
+        "Z": z,
+        "WIDTH": width,
+        "HEIGHT": height,
+        "OBJECT_TYPE": safe_text(object_type),
+        "EXTRACTION_STATUS": safe_text(extraction_status),
+        "EXTRACTION_NOTE": safe_text(extraction_note),
+    }
+
+
+def extract_pdf_text_objects(file_row: pd.Series) -> list:
+    """
+    Extract text objects from PDF using PyMuPDF if available.
+    """
+    drawing_file = file_row["DRAWING_FILE"]
+    full_path = file_row["FULL_PATH"]
+    ext = file_row["EXTENSION"]
+
+    try:
+        import fitz  # PyMuPDF
+    except Exception as exc:
+        return [make_text_object_record(
+            drawing_file, full_path, ext, "PDF",
+            text="",
+            extraction_status="FAIL",
+            extraction_note=f"PyMuPDF not available: {exc}",
+        )]
+
+    records = []
+
+    try:
+        doc = fitz.open(full_path)
+
+        for page_index, page in enumerate(doc, start=1):
+            page_name = f"PAGE_{page_index}"
+            data = page.get_text("dict")
+
+            for block in data.get("blocks", []):
+                for line in block.get("lines", []):
+                    for span in line.get("spans", []):
+                        text = safe_text(span.get("text", ""))
+                        if not text:
+                            continue
+
+                        bbox = span.get("bbox", None)
+                        if bbox and len(bbox) >= 4:
+                            x0, y0, x1, y1 = bbox[:4]
+                            width = x1 - x0
+                            height = y1 - y0
+                        else:
+                            x0 = y0 = width = height = None
+
+                        # In PDF coordinate, y increases downward.
+                        # Keep raw PDF y for consistency inside one page.
+                        records.append(make_text_object_record(
+                            drawing_file=drawing_file,
+                            full_path=full_path,
+                            extension=ext,
+                            page_or_layout=page_name,
+                            text=text,
+                            x=x0,
+                            y=y0,
+                            z=0,
+                            width=width,
+                            height=height,
+                            object_type="PDF_TEXT_SPAN",
+                            extraction_status="OK",
+                            extraction_note="",
+                        ))
+
+        doc.close()
+
+    except Exception as exc:
+        records.append(make_text_object_record(
+            drawing_file, full_path, ext, "PDF",
+            text="",
+            extraction_status="FAIL",
+            extraction_note=f"PDF extraction error: {type(exc).__name__}: {exc}",
+        ))
+
+    return records
+
+
+def extract_dwg_text_objects(file_row: pd.Series) -> list:
+    """
+    Extract text objects from DWG through AutoCAD COM.
+
+    Requirements:
+    - Windows
+    - AutoCAD installed
+    - pywin32 installed
+    - AutoCAD can open the DWG file
+
+    This function is intentionally defensive. If AutoCAD is not available,
+    it returns one FAIL record instead of crashing the entire run.
+    """
+    drawing_file = file_row["DRAWING_FILE"]
+    full_path = file_row["FULL_PATH"]
+    ext = file_row["EXTENSION"]
+
+    try:
+        import win32com.client
+    except Exception as exc:
+        return [make_text_object_record(
+            drawing_file, full_path, ext, "DWG",
+            text="",
+            extraction_status="FAIL",
+            extraction_note=f"pywin32/win32com not available: {exc}",
+        )]
+
+    records = []
+    acad = None
+    doc = None
+
+    try:
+        acad = win32com.client.Dispatch("AutoCAD.Application")
+        acad.Visible = False
+        doc = acad.Documents.Open(str(full_path))
+
+        # Read ModelSpace and PaperSpace.
+        spaces = []
+        try:
+            spaces.append(("ModelSpace", doc.ModelSpace))
+        except Exception:
+            pass
+
+        try:
+            spaces.append(("PaperSpace", doc.PaperSpace))
+        except Exception:
+            pass
+
+        for layout_name, space in spaces:
+            try:
+                for obj in space:
+                    try:
+                        object_name = safe_text(getattr(obj, "ObjectName", ""))
+                        text = ""
+
+                        if hasattr(obj, "TextString"):
+                            text = safe_text(obj.TextString)
+                        elif hasattr(obj, "Text"):
+                            text = safe_text(obj.Text)
+
+                        if not text:
+                            continue
+
+                        x = y = z = None
+                        width = height = None
+
+                        try:
+                            p = obj.InsertionPoint
+                            if len(p) >= 2:
+                                x = float(p[0])
+                                y = float(p[1])
+                            if len(p) >= 3:
+                                z = float(p[2])
+                        except Exception:
+                            pass
+
+                        try:
+                            height = float(getattr(obj, "Height", None))
+                        except Exception:
+                            height = None
+
+                        try:
+                            width = float(getattr(obj, "Width", None))
+                        except Exception:
+                            width = None
+
+                        records.append(make_text_object_record(
+                            drawing_file=drawing_file,
+                            full_path=full_path,
+                            extension=ext,
+                            page_or_layout=layout_name,
+                            text=text,
+                            x=x,
+                            y=y,
+                            z=z,
+                            width=width,
+                            height=height,
+                            object_type=object_name,
+                            extraction_status="OK",
+                            extraction_note="",
+                        ))
+
+                    except Exception:
+                        continue
+            except Exception:
+                continue
+
+    except Exception as exc:
+        records.append(make_text_object_record(
+            drawing_file, full_path, ext, "DWG",
+            text="",
+            extraction_status="FAIL",
+            extraction_note=f"DWG extraction error: {type(exc).__name__}: {exc}",
+        ))
+
+    finally:
+        try:
+            if doc is not None:
+                doc.Close(False)
+        except Exception:
+            pass
+
+    return records
+
+
+def extract_text_objects_from_files(file_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Extract TEXT_OBJECT_RAW from DWG/PDF files.
+    """
+    records = []
+
+    for i, row in file_df.iterrows():
+        print(f"[TEXT] {i + 1}/{len(file_df)}: {row['DRAWING_FILE']}")
+
+        ext = safe_text(row["EXTENSION"]).lower()
+
+        if ext == ".pdf":
+            records.extend(extract_pdf_text_objects(row))
+        elif ext == ".dwg":
+            records.extend(extract_dwg_text_objects(row))
+        else:
+            records.append(make_text_object_record(
+                row["DRAWING_FILE"], row["FULL_PATH"], ext, "UNKNOWN",
+                text="",
+                extraction_status="FAIL",
+                extraction_note=f"Unsupported extension: {ext}",
+            ))
+
+    if not records:
+        return pd.DataFrame(columns=[
+            "DRAWING_FILE", "FULL_PATH", "EXTENSION", "PAGE_OR_LAYOUT",
+            "TEXT", "X", "Y", "Z", "WIDTH", "HEIGHT",
+            "OBJECT_TYPE", "EXTRACTION_STATUS", "EXTRACTION_NOTE"
+        ])
+
+    return pd.DataFrame(records)
+
+
+# ============================================================
+# Step 2: ROW_CANDIDATES foundation
+# ============================================================
+
+def normalize_text_object_dataframe(text_df: pd.DataFrame) -> pd.DataFrame:
+    if text_df is None or text_df.empty:
+        return pd.DataFrame()
+
+    df = text_df.copy()
+
+    for col in ["DRAWING_FILE", "PAGE_OR_LAYOUT", "TEXT", "X", "Y", "WIDTH", "HEIGHT", "EXTRACTION_STATUS"]:
+        if col not in df.columns:
+            df[col] = None
+
+    df["TEXT"] = df["TEXT"].fillna("").astype(str).map(safe_text)
+    df["X"] = pd.to_numeric(df["X"], errors="coerce")
+    df["Y"] = pd.to_numeric(df["Y"], errors="coerce")
+    df["WIDTH"] = pd.to_numeric(df["WIDTH"], errors="coerce")
+    df["HEIGHT"] = pd.to_numeric(df["HEIGHT"], errors="coerce")
+
+    df = df[
+        (df["EXTRACTION_STATUS"] == "OK")
+        & (df["TEXT"].str.strip() != "")
+        & (df["X"].notna())
+        & (df["Y"].notna())
+    ].copy()
+
+    return df
+
+
+def infer_dynamic_y_tolerance(area_df: pd.DataFrame) -> float:
+    if area_df is None or area_df.empty or "HEIGHT" not in area_df.columns:
+        return ROW_Y_TOLERANCE
+
+    heights = pd.to_numeric(area_df["HEIGHT"], errors="coerce")
+    heights = heights[(heights.notna()) & (heights > 0)]
+
+    if heights.empty:
+        return ROW_Y_TOLERANCE
+
+    return max(ROW_Y_TOLERANCE, float(heights.median()) * 1.35)
+
+
+def infer_median_text_height(area_df: pd.DataFrame) -> float:
+    if area_df is None or area_df.empty or "HEIGHT" not in area_df.columns:
+        return ROW_Y_TOLERANCE
+
+    heights = pd.to_numeric(area_df["HEIGHT"], errors="coerce")
+    heights = heights[(heights.notna()) & (heights > 0)]
+
+    if heights.empty:
+        return ROW_Y_TOLERANCE
+
+    return float(heights.median())
+
+
+def assign_numeric_x_columns(numeric_df: pd.DataFrame) -> pd.DataFrame:
+    if numeric_df.empty:
+        return numeric_df.copy()
+
+    df = numeric_df.sort_values(by="X", ascending=True).copy()
+
+    widths = pd.to_numeric(df.get("WIDTH"), errors="coerce")
+    widths = widths[(widths.notna()) & (widths > 0)]
+    median_width = float(widths.median()) if not widths.empty else 3.0
+    x_tolerance = max(3.0, median_width * 2.5)
+
+    col_ids = []
+    current_col = 0
+    current_center = None
+    current_count = 0
+
+    for _, row in df.iterrows():
+        x = float(row["X"])
+
+        if current_center is None:
+            current_col += 1
+            current_center = x
+            current_count = 1
+        else:
+            if abs(x - current_center) <= x_tolerance:
+                current_center = (current_center * current_count + x) / (current_count + 1)
+                current_count += 1
+            else:
+                current_col += 1
+                current_center = x
+                current_count = 1
+
+        col_ids.append(current_col)
+
+    df["NUMERIC_X_COL"] = col_ids
+    df["NUMERIC_X_COL_TOLERANCE"] = x_tolerance
+
+    return df
+
+
+def detect_item_number_columns(area_df: pd.DataFrame) -> pd.DataFrame:
+    if area_df.empty:
+        return pd.DataFrame()
+
+    df = area_df.copy()
+    df["TEXT_CLEAN"] = df["TEXT"].astype(str).map(safe_text)
+
+    numeric_df = df[df["TEXT_CLEAN"].map(looks_like_item_no)].copy()
+
+    if numeric_df.empty:
+        return pd.DataFrame()
+
+    numeric_df["ITEM_NO_VALUE"] = numeric_df["TEXT_CLEAN"].astype(int)
+    numeric_df = assign_numeric_x_columns(numeric_df)
+
+    records = []
+
+    for col_id, col_df in numeric_df.groupby("NUMERIC_X_COL"):
+        values = sorted(col_df["ITEM_NO_VALUE"].dropna().astype(int).tolist())
+        unique_values = sorted(set(values))
+
+        if not unique_values:
+            continue
+
+        unique_count = len(unique_values)
+        value_span = max(unique_values) - min(unique_values)
+        duplicate_ratio = 1.0 - (unique_count / max(len(values), 1))
+
+        is_item_col = (
+            unique_count >= ITEM_COLUMN_MIN_UNIQUE_VALUES
+            and value_span >= ITEM_COLUMN_MIN_SPAN
+            and duplicate_ratio <= 0.70
+        )
+
+        if not is_item_col:
+            continue
+
+        records.append({
+            "NUMERIC_X_COL": col_id,
+            "ITEM_COL_X_CENTER": float(col_df["X"].mean()),
+            "ITEM_COL_X_MIN": float(col_df["X"].min()),
+            "ITEM_COL_X_MAX": float(col_df["X"].max()),
+            "ITEM_COL_UNIQUE_COUNT": unique_count,
+            "ITEM_COL_VALUE_MIN": min(unique_values),
+            "ITEM_COL_VALUE_MAX": max(unique_values),
+            "ITEM_COL_VALUE_SPAN": value_span,
+            "ITEM_COL_DUPLICATE_RATIO": duplicate_ratio,
+        })
+
+    if not records:
+        return pd.DataFrame()
+
+    out = pd.DataFrame(records).sort_values(by="ITEM_COL_X_CENTER", ascending=True).reset_index(drop=True)
+    out["ITEM_COL_INDEX"] = range(1, len(out) + 1)
+    return out
+
+
+def get_item_number_anchors(area_df: pd.DataFrame, item_cols: pd.DataFrame) -> pd.DataFrame:
+    if area_df.empty or item_cols.empty:
+        return pd.DataFrame()
+
+    df = area_df.copy()
+    df["TEXT_CLEAN"] = df["TEXT"].astype(str).map(safe_text)
+
+    numeric_df = df[df["TEXT_CLEAN"].map(looks_like_item_no)].copy()
+
+    if numeric_df.empty:
+        return pd.DataFrame()
+
+    numeric_df["ITEM_NO_VALUE"] = numeric_df["TEXT_CLEAN"].astype(int)
+    numeric_df = assign_numeric_x_columns(numeric_df)
+
+    anchors = numeric_df.merge(item_cols, on="NUMERIC_X_COL", how="inner")
+
+    if anchors.empty:
+        return pd.DataFrame()
+
+    anchors = anchors.sort_values(by=["ITEM_COL_INDEX", "Y"], ascending=[True, False]).reset_index(drop=True)
+
+    # De-duplicate near identical anchors.
+    y_tol = infer_dynamic_y_tolerance(area_df)
+    kept = []
+
+    for _, a in anchors.iterrows():
+        duplicate = False
+        for k in kept:
+            if (
+                int(k["ITEM_NO_VALUE"]) == int(a["ITEM_NO_VALUE"])
+                and int(k["ITEM_COL_INDEX"]) == int(a["ITEM_COL_INDEX"])
+                and abs(float(k["Y"]) - float(a["Y"])) <= y_tol * 0.35
+            ):
+                duplicate = True
+                break
+        if not duplicate:
+            kept.append(a)
+
+    return pd.DataFrame(kept).reset_index(drop=True) if kept else pd.DataFrame()
+
+
+def get_anchor_boundaries(anchor: pd.Series, item_col_centers: list, median_height: float) -> tuple:
+    anchor_x = float(anchor["X"])
+    current_center = float(anchor["ITEM_COL_X_CENTER"])
+
+    x_min = anchor_x - max(3.0, median_height * 2.0)
+
+    next_centers = [x for x in item_col_centers if x > current_center]
+    if next_centers:
+        next_center = min(next_centers)
+        x_max = next_center - max(4.0, (next_center - current_center) * 0.08)
+    else:
+        x_max = anchor_x + max(80.0, median_height * 45.0)
+
+    return x_min, x_max
+
+
+def base_row_defaults() -> dict:
+    return {
+        "ROOT_FLAG": False,
+        "ROOT_PART_NO": None,
+        "ROOT_PART_NAME": None,
+        "ROOT_SOURCE": None,
+        "ROOT_GROUP_KEY": None,
+        "ROOT_SOURCE_FILES": None,
+        "ROOT_SOURCE_FILE_COUNT": None,
+        "ORPHAN_RESCUE_FLAG": False,
+        "ORPHAN_RESCUE_SCORE": None,
+        "ORPHAN_RESCUE_REASON": None,
+        "FRAGMENT_MERGE_FLAG": False,
+        "LEFT_FRAGMENT_TEXT": None,
+        "RIGHT_FRAGMENT_TEXT": None,
+        "MERGE_REASON": None,
+    }
+
+
+def make_row_record(
+    drawing_file,
+    layout_name,
+    row_group,
+    row_segment,
+    row_id,
+    texts,
+    x_positions,
+    row_df,
+    segment_method,
+    item_anchor_value=None,
+    item_anchor_x=None,
+    item_anchor_y=None,
+    item_col_index=None,
+    item_col_x_center=None,
+    rowspan_parent_item=None,
+    rowspan_child_index=0,
+    rowspan_expanded=False,
+    row_x_window_min=None,
+    row_x_window_max=None,
+    row_y_tolerance=None,
+    x_gap_threshold=None,
+) -> dict:
+    clean_texts = [safe_text(t) for t in texts if safe_text(t)]
+    raw_text = " | ".join(clean_texts)
+
+    d = {
+        "DRAWING_FILE": drawing_file,
+        "PAGE_OR_LAYOUT": layout_name,
+        "ROW_GROUP": row_group,
+        "ROW_SEGMENT": row_segment,
+        "ROW_ID": row_id,
+        "ITEM_ANCHOR_VALUE": item_anchor_value,
+        "ITEM_ANCHOR_X": item_anchor_x,
+        "ITEM_ANCHOR_Y": item_anchor_y,
+        "ITEM_COL_INDEX": item_col_index,
+        "ITEM_COL_X_CENTER": item_col_x_center,
+        "ROWSPAN_PARENT_ITEM": rowspan_parent_item,
+        "ROWSPAN_CHILD_INDEX": rowspan_child_index,
+        "ROWSPAN_EXPANDED": bool(rowspan_expanded),
+        "ROW_Y_MEAN": row_df["Y"].mean() if row_df is not None and not row_df.empty else None,
+        "ROW_Y_MIN": row_df["Y"].min() if row_df is not None and not row_df.empty else None,
+        "ROW_Y_MAX": row_df["Y"].max() if row_df is not None and not row_df.empty else None,
+        "ROW_X_MIN": row_df["X"].min() if row_df is not None and not row_df.empty else None,
+        "ROW_X_MAX": row_df["X"].max() if row_df is not None and not row_df.empty else None,
+        "ROW_X_WINDOW_MIN": row_x_window_min,
+        "ROW_X_WINDOW_MAX": row_x_window_max,
+        "TEXT_COUNT": len(clean_texts),
+        "TEXTS": clean_texts,
+        "X_POSITIONS": x_positions if isinstance(x_positions, list) else [],
+        "RAW_ROW_TEXT": raw_text,
+        "ROW_Y_TOLERANCE_USED": row_y_tolerance,
+        "X_GAP_THRESHOLD_USED": x_gap_threshold,
+        "SEGMENT_METHOD": segment_method,
+    }
+    d.update(base_row_defaults())
+    return d
+
+
+def detect_detail_line_groups(detail_df: pd.DataFrame, y_tolerance: float) -> list:
+    if detail_df.empty:
+        return []
+
+    df = detail_df.sort_values(by=["Y", "X"], ascending=[False, True]).copy()
+
+    groups = []
+    current_indices = []
+    current_y = None
+    current_count = 0
+
+    for idx, row in df.iterrows():
+        y = float(row["Y"])
+
+        if current_y is None:
+            current_indices = [idx]
+            current_y = y
+            current_count = 1
+        else:
+            if abs(current_y - y) <= y_tolerance:
+                current_indices.append(idx)
+                current_y = (current_y * current_count + y) / (current_count + 1)
+                current_count += 1
+            else:
+                if current_indices:
+                    groups.append(df.loc[current_indices].copy())
+                current_indices = [idx]
+                current_y = y
+                current_count = 1
+
+    if current_indices:
+        groups.append(df.loc[current_indices].copy())
+
+    return groups
+
+
+def get_inherited_left_texts(area_df: pd.DataFrame, anchor: pd.Series, x_min: float, x_detail_min: float, y_low: float, y_high: float) -> list:
+    left_df = area_df[
+        (area_df["X"] >= x_min)
+        & (area_df["X"] < x_detail_min)
+        & (area_df["Y"] >= y_low)
+        & (area_df["Y"] <= y_high)
+    ].copy()
+
+    anchor_text = safe_text(anchor.get("TEXT", ""))
+
+    if left_df.empty:
+        return [anchor_text] if anchor_text else []
+
+    left_df = left_df.sort_values(by="X", ascending=True)
+    texts = left_df["TEXT"].astype(str).map(safe_text).tolist()
+
+    if anchor_text and anchor_text not in texts:
+        texts = [anchor_text] + texts
+
+    out = []
+    for t in texts:
+        if t and t not in out:
+            out.append(t)
+    return out
+
+
+def build_rowspan_expanded_rows_for_anchor(
+    area_df: pd.DataFrame,
+    anchor: pd.Series,
+    anchor_idx: int,
+    item_col_centers: list,
+    anchors_same_col: pd.DataFrame,
+    y_tolerance: float,
+    median_height: float,
+) -> list:
+    drawing_file = anchor["DRAWING_FILE"]
+    layout_name = anchor["PAGE_OR_LAYOUT"]
+    item_col_index = int(anchor["ITEM_COL_INDEX"])
+    item_no_value = int(anchor["ITEM_NO_VALUE"])
+    anchor_x = float(anchor["X"])
+    anchor_y = float(anchor["Y"])
+    current_center = float(anchor["ITEM_COL_X_CENTER"])
+
+    x_min, x_max = get_anchor_boundaries(anchor, item_col_centers, median_height)
+
+    lower_anchors = anchors_same_col[anchors_same_col["Y"] < anchor_y].sort_values(by="Y", ascending=False)
+    if not lower_anchors.empty:
+        next_anchor_y = float(lower_anchors.iloc[0]["Y"])
+        block_y_low = next_anchor_y + max(1.0, y_tolerance * 0.25)
+    else:
+        block_y_low = anchor_y - max(y_tolerance * ROWSPAN_VERTICAL_SEARCH_MULTIPLIER, median_height * ROWSPAN_VERTICAL_SEARCH_MULTIPLIER)
+
+    block_y_high = anchor_y + y_tolerance
+
+    block_df = area_df[
+        (area_df["Y"] >= block_y_low)
+        & (area_df["Y"] <= block_y_high)
+        & (area_df["X"] >= x_min)
+        & (area_df["X"] < x_max)
+    ].copy()
+
+    if block_df.empty:
+        return []
+
+    right_df = block_df[block_df["X"] > anchor_x + max(4.0, median_height * 2.0)].copy()
+    if right_df.empty:
+        return []
+
+    qty_df = right_df[right_df["TEXT"].astype(str).map(looks_like_qty)].copy()
+    if not qty_df.empty:
+        x_detail_min = max(x_min, float(qty_df["X"].min()) - 4.0)
+    else:
+        x_detail_min = max(x_min, float(right_df["X"].quantile(0.25)) - 4.0)
+
+    detail_df = block_df[(block_df["X"] >= x_detail_min) & (block_df["X"] < x_max)].copy()
+    if detail_df.empty:
+        return []
+
+    detail_groups = detect_detail_line_groups(detail_df, y_tolerance=max(1.0, y_tolerance * 0.85))
+
+    valid_groups = []
+    for g in detail_groups:
+        tokens = g["TEXT"].astype(str).map(safe_text).tolist()
+        score, reason = detail_group_score(tokens)
+        if score >= ORPHAN_DETAIL_MIN_SCORE:
+            valid_groups.append((g, score, reason))
+
+    if len(valid_groups) < ROWSPAN_MIN_DETAIL_LINES:
+        return []
+
+    inherited_left_texts = get_inherited_left_texts(area_df, anchor, x_min, x_detail_min, block_y_low, block_y_high)
+    rows = []
+
+    for child_idx, (g, score, reason) in enumerate(valid_groups, start=1):
+        g = g.sort_values(by="X", ascending=True)
+        detail_texts = g["TEXT"].astype(str).map(safe_text).tolist()
+        texts = inherited_left_texts + detail_texts
+        xs = [anchor_x for _ in inherited_left_texts] + g["X"].tolist()
+
+        rows.append(make_row_record(
+            drawing_file=drawing_file,
+            layout_name=layout_name,
+            row_group=anchor_idx + 1,
+            row_segment=item_col_index,
+            row_id=f"{drawing_file}::{layout_name}::ITEM{item_no_value:03d}::C{item_col_index:02d}::RS{child_idx:02d}",
+            texts=texts,
+            x_positions=xs,
+            row_df=g,
+            segment_method="ITEM_ANCHOR_ROWSPAN_EXPANSION",
+            item_anchor_value=item_no_value,
+            item_anchor_x=anchor_x,
+            item_anchor_y=anchor_y,
+            item_col_index=item_col_index,
+            item_col_x_center=current_center,
+            rowspan_parent_item=item_no_value,
+            rowspan_child_index=child_idx,
+            rowspan_expanded=True,
+            row_x_window_min=x_min,
+            row_x_window_max=x_max,
+            row_y_tolerance=y_tolerance,
+        ))
+
+    return rows
+
+
+def build_normal_anchor_row(area_df: pd.DataFrame, anchor: pd.Series, anchor_idx: int, item_col_centers: list, y_tolerance: float, median_height: float) -> dict:
+    drawing_file = anchor["DRAWING_FILE"]
+    layout_name = anchor["PAGE_OR_LAYOUT"]
+    item_col_index = int(anchor["ITEM_COL_INDEX"])
+    item_no_value = int(anchor["ITEM_NO_VALUE"])
+    anchor_x = float(anchor["X"])
+    anchor_y = float(anchor["Y"])
+    current_center = float(anchor["ITEM_COL_X_CENTER"])
+
+    x_min, x_max = get_anchor_boundaries(anchor, item_col_centers, median_height)
+
+    row_df = area_df[
+        (area_df["Y"] >= anchor_y - y_tolerance)
+        & (area_df["Y"] <= anchor_y + y_tolerance)
+        & (area_df["X"] >= x_min)
+        & (area_df["X"] < x_max)
+    ].copy()
+
+    if row_df.empty:
+        row_df = anchor.to_frame().T.copy()
+
+    row_df = row_df.sort_values(by="X", ascending=True)
+    texts = row_df["TEXT"].astype(str).map(safe_text).tolist()
+    xs = row_df["X"].tolist()
+
+    return make_row_record(
+        drawing_file=drawing_file,
+        layout_name=layout_name,
+        row_group=anchor_idx + 1,
+        row_segment=item_col_index,
+        row_id=f"{drawing_file}::{layout_name}::ITEM{item_no_value:03d}::C{item_col_index:02d}",
+        texts=texts,
+        x_positions=xs,
+        row_df=row_df,
+        segment_method="ITEM_NUMBER_ANCHOR_REBUILD",
+        item_anchor_value=item_no_value,
+        item_anchor_x=anchor_x,
+        item_anchor_y=anchor_y,
+        item_col_index=item_col_index,
+        item_col_x_center=current_center,
+        rowspan_parent_item=item_no_value,
+        rowspan_child_index=0,
+        rowspan_expanded=False,
+        row_x_window_min=x_min,
+        row_x_window_max=x_max,
+        row_y_tolerance=y_tolerance,
+    )
+
+
+def build_anchor_based_row_candidates_for_area(area_df: pd.DataFrame) -> pd.DataFrame:
+    if area_df.empty:
+        return pd.DataFrame()
+
+    area_df = area_df.sort_values(by=["Y", "X"], ascending=[False, True]).copy()
+    y_tolerance = infer_dynamic_y_tolerance(area_df)
+    median_height = infer_median_text_height(area_df)
+
+    item_cols = detect_item_number_columns(area_df)
+    if item_cols.empty:
+        return pd.DataFrame()
+
+    anchors = get_item_number_anchors(area_df, item_cols)
+    if anchors.empty:
+        return pd.DataFrame()
+
+    item_col_centers = item_cols["ITEM_COL_X_CENTER"].tolist()
+    records = []
+
+    for anchor_idx, anchor in anchors.iterrows():
+        item_col_index = int(anchor["ITEM_COL_INDEX"])
+        anchors_same_col = anchors[anchors["ITEM_COL_INDEX"] == item_col_index].copy()
+
+        rowspan_rows = build_rowspan_expanded_rows_for_anchor(
+            area_df=area_df,
+            anchor=anchor,
+            anchor_idx=anchor_idx,
+            item_col_centers=item_col_centers,
+            anchors_same_col=anchors_same_col,
+            y_tolerance=y_tolerance,
+            median_height=median_height,
+        )
+
+        if rowspan_rows:
+            records.extend(rowspan_rows)
+        else:
+            records.append(build_normal_anchor_row(
+                area_df=area_df,
+                anchor=anchor,
+                anchor_idx=anchor_idx,
+                item_col_centers=item_col_centers,
+                y_tolerance=y_tolerance,
+                median_height=median_height,
+            ))
+
+    return pd.DataFrame(records)
+
+
+def assign_row_groups(area_df: pd.DataFrame, y_tolerance: float = None) -> pd.DataFrame:
+    if area_df.empty:
+        return area_df.copy()
+
+    if y_tolerance is None:
+        y_tolerance = infer_dynamic_y_tolerance(area_df)
+
+    df = area_df.sort_values(by=["Y", "X"], ascending=[False, True]).copy()
+
+    row_group_ids = []
+    current_group = 0
+    current_y = None
+    current_count = 0
+
+    for _, row in df.iterrows():
+        y = float(row["Y"])
+
+        if current_y is None:
+            current_group += 1
+            current_y = y
+            current_count = 1
+        else:
+            if abs(current_y - y) <= y_tolerance:
+                current_y = (current_y * current_count + y) / (current_count + 1)
+                current_count += 1
+            else:
+                current_group += 1
+                current_y = y
+                current_count = 1
+
+        row_group_ids.append(current_group)
+
+    df["ROW_GROUP"] = row_group_ids
+    df["ROW_Y_TOLERANCE_USED"] = y_tolerance
+    return df
+
+
+def infer_x_gap_threshold(row_df: pd.DataFrame) -> float:
+    if row_df.empty or len(row_df) <= 1:
+        return 18.0
+
+    df = row_df.sort_values(by="X").copy()
+    xs = pd.to_numeric(df["X"], errors="coerce").dropna().tolist()
+
+    gaps = [xs[i] - xs[i - 1] for i in range(1, len(xs)) if xs[i] > xs[i - 1]]
+
+    median_gap = float(pd.Series(gaps).median()) if gaps else 18.0
+
+    widths = pd.to_numeric(df.get("WIDTH"), errors="coerce")
+    widths = widths[(widths.notna()) & (widths > 0)]
+    median_width = float(widths.median()) if not widths.empty else 0.0
+
+    return max(18.0, median_gap * 2.0, median_width * 3.0 if median_width > 0 else 18.0)
+
+
+def split_y_group_into_x_segments(row_df: pd.DataFrame) -> list:
+    if row_df.empty:
+        return []
+
+    df = row_df.sort_values(by="X", ascending=True).copy()
+    if len(df) <= 1:
+        return [df]
+
+    gap_threshold = infer_x_gap_threshold(df)
+    segments = []
+    current = []
+    previous_x = None
+
+    for idx, row in df.iterrows():
+        x = float(row["X"])
+        if previous_x is None:
+            current = [idx]
+        else:
+            if x - previous_x > gap_threshold:
+                if current:
+                    seg = df.loc[current].copy()
+                    seg["X_GAP_THRESHOLD_USED"] = gap_threshold
+                    segments.append(seg)
+                current = [idx]
+            else:
+                current.append(idx)
+        previous_x = x
+
+    if current:
+        seg = df.loc[current].copy()
+        seg["X_GAP_THRESHOLD_USED"] = gap_threshold
+        segments.append(seg)
+
+    return segments
+
+
+def build_fallback_y_x_rows_for_area(area_df: pd.DataFrame) -> pd.DataFrame:
+    if area_df.empty:
+        return pd.DataFrame()
+
+    grouped = assign_row_groups(area_df)
+    records = []
+
+    for (drawing_file, layout_name, row_group), y_row_df in grouped.groupby(["DRAWING_FILE", "PAGE_OR_LAYOUT", "ROW_GROUP"]):
+        segments = split_y_group_into_x_segments(y_row_df)
+
+        for segment_no, seg in enumerate(segments, start=1):
+            seg = seg.sort_values(by="X")
+            texts = seg["TEXT"].astype(str).map(safe_text).tolist()
+            xs = seg["X"].tolist()
+
+            records.append(make_row_record(
+                drawing_file=drawing_file,
+                layout_name=layout_name,
+                row_group=row_group,
+                row_segment=segment_no,
+                row_id=f"{drawing_file}::{layout_name}::R{int(row_group):04d}::S{segment_no:02d}",
+                texts=texts,
+                x_positions=xs,
+                row_df=seg,
+                segment_method="FALLBACK_Y_GROUP_THEN_X_GAP_SPLIT",
+                row_y_tolerance=seg["ROW_Y_TOLERANCE_USED"].iloc[0] if "ROW_Y_TOLERANCE_USED" in seg.columns else None,
+                x_gap_threshold=seg["X_GAP_THRESHOLD_USED"].iloc[0] if "X_GAP_THRESHOLD_USED" in seg.columns else None,
+            ))
+
+    return pd.DataFrame(records)
+
+
+def row_candidate_covers_text(candidate_df: pd.DataFrame, text_row: pd.Series, y_tolerance: float) -> bool:
+    if candidate_df is None or candidate_df.empty:
+        return False
+
+    same_area = candidate_df[
+        (candidate_df["DRAWING_FILE"] == text_row["DRAWING_FILE"])
+        & (candidate_df["PAGE_OR_LAYOUT"] == text_row["PAGE_OR_LAYOUT"])
+    ]
+
+    if same_area.empty:
+        return False
+
+    x = float(text_row["X"])
+    y = float(text_row["Y"])
+    txt = safe_text(text_row["TEXT"])
+
+    for _, c in same_area.iterrows():
+        cy = to_float(c.get("ROW_Y_MEAN"))
+        xmin = to_float(c.get("ROW_X_WINDOW_MIN"), to_float(c.get("ROW_X_MIN")))
+        xmax = to_float(c.get("ROW_X_WINDOW_MAX"), to_float(c.get("ROW_X_MAX")))
+        raw = safe_text(c.get("RAW_ROW_TEXT", ""))
+
+        if cy is None:
+            continue
+
+        y_close = abs(cy - y) <= y_tolerance * 0.80
+        x_inside = xmin is not None and xmax is not None and (xmin - 3.0 <= x <= xmax + 3.0)
+
+        if y_close and (x_inside or txt in raw):
+            return True
+
+    return False
+
+
+def build_orphan_detail_rescue_rows_for_area(area_df: pd.DataFrame, existing_rows: pd.DataFrame) -> pd.DataFrame:
+    if area_df.empty:
+        return pd.DataFrame()
+
+    y_tolerance = infer_dynamic_y_tolerance(area_df)
+    grouped = assign_row_groups(area_df, y_tolerance=y_tolerance)
+    records = []
+
+    for (drawing_file, layout_name, row_group), y_row_df in grouped.groupby(["DRAWING_FILE", "PAGE_OR_LAYOUT", "ROW_GROUP"]):
+        uncovered = []
+
+        for _, trow in y_row_df.iterrows():
+            if not row_candidate_covers_text(existing_rows, trow, y_tolerance):
+                uncovered.append(trow)
+
+        if not uncovered:
+            continue
+
+        uncovered_df = pd.DataFrame(uncovered).sort_values(by="X")
+        segments = split_y_group_into_x_segments(uncovered_df)
+
+        for seg_no, seg in enumerate(segments, start=1):
+            seg = seg.sort_values(by="X")
+            tokens = seg["TEXT"].astype(str).map(safe_text).tolist()
+            score, reason = detail_group_score(tokens)
+
+            if score < ORPHAN_DETAIL_MIN_SCORE:
+                continue
+
+            d = make_row_record(
+                drawing_file=drawing_file,
+                layout_name=layout_name,
+                row_group=row_group,
+                row_segment=seg_no,
+                row_id=f"{drawing_file}::{layout_name}::ORPHAN_R{int(row_group):04d}::S{seg_no:02d}",
+                texts=tokens,
+                x_positions=seg["X"].tolist(),
+                row_df=seg,
+                segment_method="ORPHAN_DETAIL_RESCUE",
+                row_y_tolerance=y_tolerance,
+                x_gap_threshold=seg["X_GAP_THRESHOLD_USED"].iloc[0] if "X_GAP_THRESHOLD_USED" in seg.columns else None,
+            )
+            d["ORPHAN_RESCUE_FLAG"] = True
+            d["ORPHAN_RESCUE_SCORE"] = score
+            d["ORPHAN_RESCUE_REASON"] = reason
+            records.append(d)
+
+    return pd.DataFrame(records)
+
+
+def is_left_item_name_fragment(row: pd.Series) -> bool:
+    texts = row.get("TEXTS", [])
+    if not isinstance(texts, list):
+        return False
+
+    tokens = [safe_text(t) for t in texts if safe_text(t)]
+
+    if len(tokens) < 2 or len(tokens) > 4:
+        return False
+
+    if not looks_like_item_no(tokens[0]):
+        return False
+
+    if any(looks_like_part_no(t) for t in tokens[1:]):
+        return False
+
+    if any(looks_like_maker_text(t) for t in tokens[1:]):
+        return False
+
+    return True
+
+
+def is_right_detail_fragment(row: pd.Series) -> bool:
+    texts = row.get("TEXTS", [])
+    if not isinstance(texts, list):
+        return False
+
+    tokens = [safe_text(t) for t in texts if safe_text(t)]
+    if len(tokens) < 2:
+        return False
+
+    score, _ = detail_group_score(tokens)
+    return score >= ORPHAN_DETAIL_MIN_SCORE
+
+
+def find_best_right_for_left(left_row: pd.Series, right_df: pd.DataFrame, y_tolerance: float):
+    best = None
+    best_key = None
+
+    for idx, r in right_df.iterrows():
+        try:
+            dy = abs(float(left_row["ROW_Y_MEAN"]) - float(r["ROW_Y_MEAN"]))
+            lx = float(left_row["ROW_X_MIN"])
+            rx = float(r["ROW_X_MIN"])
+        except Exception:
+            continue
+
+        if dy > max(y_tolerance * 2.5, 8.0):
+            continue
+
+        if rx < lx:
+            continue
+
+        key = (dy, rx - lx)
+        if best_key is None or key < best_key:
+            best_key = key
+            best = (idx, r)
+
+    return best
+
+
+def merge_left_right_fragments(row_df: pd.DataFrame) -> pd.DataFrame:
+    if row_df is None or row_df.empty:
+        return row_df
+
+    df = row_df.copy()
+    merged = []
+    drop_indices = set()
+
+    for (drawing_file, layout_name), area_df in df.groupby(["DRAWING_FILE", "PAGE_OR_LAYOUT"], dropna=False):
+        y_tol_values = pd.to_numeric(area_df.get("ROW_Y_TOLERANCE_USED"), errors="coerce")
+        y_tol_values = y_tol_values[y_tol_values.notna() & (y_tol_values > 0)]
+        y_tolerance = float(y_tol_values.median()) if not y_tol_values.empty else ROW_Y_TOLERANCE
+
+        left_df = area_df[area_df.apply(is_left_item_name_fragment, axis=1)].copy()
+        right_df = area_df[area_df.apply(is_right_detail_fragment, axis=1)].copy()
+
+        if left_df.empty or right_df.empty:
+            continue
+
+        used_right = set()
+
+        for left_idx, left_row in left_df.iterrows():
+            available = right_df[~right_df.index.isin(used_right)].copy()
+            best = find_best_right_for_left(left_row, available, y_tolerance)
+            if best is None:
+                continue
+
+            right_idx, right_row = best
+            used_right.add(right_idx)
+            drop_indices.add(left_idx)
+            drop_indices.add(right_idx)
+
+            left_texts = left_row.get("TEXTS", [])
+            right_texts = right_row.get("TEXTS", [])
+            if not isinstance(left_texts, list):
+                left_texts = [safe_text(left_row.get("RAW_ROW_TEXT", ""))]
+            if not isinstance(right_texts, list):
+                right_texts = [safe_text(right_row.get("RAW_ROW_TEXT", ""))]
+
+            texts = [safe_text(t) for t in left_texts + right_texts if safe_text(t)]
+
+            tmp_df = pd.DataFrame({
+                "X": [to_float(left_row.get("ROW_X_MIN")), to_float(right_row.get("ROW_X_MAX"))],
+                "Y": [to_float(left_row.get("ROW_Y_MEAN")), to_float(right_row.get("ROW_Y_MEAN"))],
+            }).dropna()
+
+            record = make_row_record(
+                drawing_file=drawing_file,
+                layout_name=layout_name,
+                row_group=left_row.get("ROW_GROUP"),
+                row_segment=left_row.get("ROW_SEGMENT"),
+                row_id=f"{left_row.get('ROW_ID')}::MERGED::{right_row.get('ROW_ID')}",
+                texts=texts,
+                x_positions=[],
+                row_df=tmp_df if not tmp_df.empty else pd.DataFrame({"X": [], "Y": []}),
+                segment_method="LEFT_RIGHT_FRAGMENT_MERGE",
+                item_anchor_value=left_row.get("ITEM_ANCHOR_VALUE"),
+                item_anchor_x=left_row.get("ITEM_ANCHOR_X"),
+                item_anchor_y=left_row.get("ITEM_ANCHOR_Y"),
+                item_col_index=left_row.get("ITEM_COL_INDEX"),
+                item_col_x_center=left_row.get("ITEM_COL_X_CENTER"),
+                rowspan_parent_item=left_row.get("ROWSPAN_PARENT_ITEM"),
+                rowspan_child_index=left_row.get("ROWSPAN_CHILD_INDEX"),
+                rowspan_expanded=False,
+            )
+            record["FRAGMENT_MERGE_FLAG"] = True
+            record["LEFT_FRAGMENT_TEXT"] = safe_text(left_row.get("RAW_ROW_TEXT", ""))
+            record["RIGHT_FRAGMENT_TEXT"] = safe_text(right_row.get("RAW_ROW_TEXT", ""))
+            record["MERGE_REASON"] = "LEFT_ITEM_NAME_WITH_RIGHT_DETAIL"
+            merged.append(record)
+
+    if not merged:
+        return df
+
+    keep_df = df.drop(index=list(drop_indices), errors="ignore").copy()
+    merged_df = pd.DataFrame(merged)
+
+    for col in keep_df.columns:
+        if col not in merged_df.columns:
+            merged_df[col] = None
+    for col in merged_df.columns:
+        if col not in keep_df.columns:
+            keep_df[col] = None
+
+    merged_df = merged_df[keep_df.columns]
+    out = pd.concat([keep_df, merged_df], ignore_index=True)
+    return out.reset_index(drop=True)
+
+
+def build_row_candidates(text_df: pd.DataFrame) -> pd.DataFrame:
+    normalized = normalize_text_object_dataframe(text_df)
+
+    if normalized.empty:
+        return pd.DataFrame()
+
+    all_frames = []
+
+    for (drawing_file, layout_name), area_df in normalized.groupby(["DRAWING_FILE", "PAGE_OR_LAYOUT"]):
+        anchor_rows = build_anchor_based_row_candidates_for_area(area_df)
+
+        if not anchor_rows.empty:
+            orphan_rows = build_orphan_detail_rescue_rows_for_area(area_df, anchor_rows)
+            frames = [anchor_rows]
+            if not orphan_rows.empty:
+                frames.append(orphan_rows)
+            area_rows = pd.concat(frames, ignore_index=True)
+        else:
+            area_rows = build_fallback_y_x_rows_for_area(area_df)
+            if not area_rows.empty:
+                orphan_rows = build_orphan_detail_rescue_rows_for_area(area_df, area_rows)
+                if not orphan_rows.empty:
+                    area_rows = pd.concat([area_rows, orphan_rows], ignore_index=True)
+
+        if not area_rows.empty:
+            all_frames.append(area_rows)
+
+    if not all_frames:
+        return pd.DataFrame()
+
+    row_df = pd.concat(all_frames, ignore_index=True)
+    row_df = merge_left_right_fragments(row_df)
+
+    row_df["_DEDUP_KEY"] = (
+        row_df["DRAWING_FILE"].astype(str) + "||" +
+        row_df["PAGE_OR_LAYOUT"].astype(str) + "||" +
+        row_df["RAW_ROW_TEXT"].astype(str) + "||" +
+        pd.to_numeric(row_df["ROW_Y_MEAN"], errors="coerce").round(3).astype(str)
+    )
+    row_df = row_df.drop_duplicates(subset=["_DEDUP_KEY"]).drop(columns=["_DEDUP_KEY"])
+    return row_df.reset_index(drop=True)
+
+
+# ============================================================
+# Step 2.5: ROOT row injection with de-duplication
+# ============================================================
+
+def normalize_root_part_no_from_filename(drawing_file: str) -> str:
+    """
+    Normalize drawing file name into one ROOT part number.
+
+    Example:
+    8106ASD-001004RB -> 8106ASD
+    8106ASD-002004RB -> 8106ASD
+    """
+    name = Path(str(drawing_file)).name
+    stem = safe_text(Path(name).stem)
+
+    if not stem:
+        return ""
+
+    s = stem.strip()
+
+    # User-specific sheet pattern: ITEM-001004RB
+    for pat in [
+        r"(?i)^(.*?)-\d{6}[A-Z]{1,4}$",
+        r"(?i)^(.*?)_\d{6}[A-Z]{1,4}$",
+        r"(?i)^(.*?)\s+\d{6}[A-Z]{1,4}$",
+    ]:
+        m = re.fullmatch(pat, s)
+        if m:
+            candidate = safe_text(m.group(1)).rstrip("-_ ")
+            if len(candidate) >= 3:
+                return candidate
+
+    # Common sheet suffixes
+    patterns = [
+        r"(?i)(.*?)[-_ ]SHEET[-_ ]?\d+$",
+        r"(?i)(.*?)[-_ ]SHT[-_ ]?\d+$",
+        r"(?i)(.*?)[-_ ]PAGE[-_ ]?\d+$",
+        r"(?i)(.*?)[-_ ]PG[-_ ]?\d+$",
+        r"(?i)(.*?)[-_ ]DWG[-_ ]?\d+$",
+        r"(?i)(.*?)[-_ ]도면[-_ ]?\d+$",
+        r"(?i)(.*?)[-_ ](0\d{1,2})$",
+        r"(?i)(.*?)[-_ ](\d{1,2})$",
+    ]
+
+    for pat in patterns:
+        m = re.fullmatch(pat, s)
+        if m:
+            candidate = safe_text(m.group(1)).rstrip("-_ ")
+            if len(candidate) >= 4:
+                return candidate
+
+    return s
+
+
+def build_drawing_self_root_rows(file_df: pd.DataFrame) -> pd.DataFrame:
+    if file_df is None or file_df.empty:
+        return pd.DataFrame()
+
+    temp = []
+
+    for _, f in file_df.iterrows():
+        drawing_file = safe_text(f.get("DRAWING_FILE", ""))
+        full_path = safe_text(f.get("FULL_PATH", ""))
+
+        if not drawing_file:
+            continue
+
+        root_part_no = normalize_root_part_no_from_filename(drawing_file)
+        if not root_part_no:
+            root_part_no = safe_text(Path(drawing_file).stem)
+
+        temp.append({
+            "DRAWING_FILE": drawing_file,
+            "FULL_PATH": full_path,
+            "ROOT_PART_NO": root_part_no,
+        })
+
+    if not temp:
+        return pd.DataFrame()
+
+    temp_df = pd.DataFrame(temp)
+    records = []
+
+    for root_part_no, g in temp_df.groupby("ROOT_PART_NO", dropna=False):
+        root_part_no = safe_text(root_part_no)
+        if not root_part_no:
+            continue
+
+        source_files = sorted(g["DRAWING_FILE"].dropna().astype(str).unique().tolist())
+        source_paths = sorted(g["FULL_PATH"].dropna().astype(str).unique().tolist())
+
+        representative_file = source_files[0] if source_files else root_part_no
+        root_part_name = "ROOT_DRAWING_SELF"
+
+        tmp_df = pd.DataFrame({"X": [], "Y": []})
+        record = make_row_record(
+            drawing_file=representative_file,
+            layout_name="ROOT",
+            row_group=0,
+            row_segment=0,
+            row_id=f"{root_part_no}::ROOT::DRAWING_SELF",
+            texts=["ROOT", root_part_name, "1", root_part_no, "DRAWING_SELF"],
+            x_positions=[],
+            row_df=tmp_df,
+            segment_method="DRAWING_SELF_ROOT_INJECTION_DEDUPED",
+            item_anchor_value=0,
+            item_col_index=0,
+            rowspan_parent_item=0,
+            rowspan_child_index=0,
+            rowspan_expanded=False,
+        )
+        record["ROOT_FLAG"] = True
+        record["ROOT_PART_NO"] = root_part_no
+        record["ROOT_PART_NAME"] = root_part_name
+        record["ROOT_SOURCE"] = "; ".join(source_paths)
+        record["ROOT_GROUP_KEY"] = root_part_no
+        record["ROOT_SOURCE_FILES"] = "; ".join(source_files)
+        record["ROOT_SOURCE_FILE_COUNT"] = len(source_files)
+        record["ROW_Y_MEAN"] = None
+        record["ROW_Y_MIN"] = None
+        record["ROW_Y_MAX"] = None
+        record["ROW_X_MIN"] = None
+        record["ROW_X_MAX"] = None
+        records.append(record)
+
+    return pd.DataFrame(records)
+
+
+def add_drawing_self_root_rows(file_df: pd.DataFrame, row_candidate_df: pd.DataFrame) -> pd.DataFrame:
+    root_df = build_drawing_self_root_rows(file_df)
+
+    if row_candidate_df is None or row_candidate_df.empty:
+        return root_df.copy()
+
+    df = row_candidate_df.copy()
+
+    for col in root_df.columns:
+        if col not in df.columns:
+            df[col] = None
+    for col in df.columns:
+        if col not in root_df.columns:
+            root_df[col] = None
+
+    root_df = root_df[df.columns]
+
+    if "ROOT_FLAG" not in df.columns:
+        df["ROOT_FLAG"] = False
+    if "ROOT_PART_NO" not in df.columns:
+        df["ROOT_PART_NO"] = None
+
+    existing_roots = set(
+        df[df["ROOT_FLAG"].fillna(False).astype(bool)]["ROOT_PART_NO"].dropna().astype(str).tolist()
+    )
+
+    root_df = root_df[~root_df["ROOT_PART_NO"].astype(str).isin(existing_roots)].copy()
+
+    out = pd.concat([root_df, df], ignore_index=True)
+    return out.reset_index(drop=True)
+
+
+# ============================================================
+# Step 3: BOM_ZONE candidates - Step 1
+# ============================================================
+
+def token_contains_any_keyword(text: str, keywords: set) -> bool:
+    value = safe_text(text).upper()
+    if not value:
+        return False
+    return any(safe_text(k).upper() in value for k in keywords)
+
+
+def infer_area_height(text_df: pd.DataFrame, fallback: float = 2.5) -> float:
+    if text_df is None or text_df.empty or "HEIGHT" not in text_df.columns:
+        return fallback
+
+    heights = pd.to_numeric(text_df["HEIGHT"], errors="coerce")
+    heights = heights[(heights.notna()) & (heights > 0)]
+
+    if heights.empty:
+        return fallback
+
+    return float(heights.median())
+
+
+def build_single_header_candidate_record(drawing_file: str, layout_name: str, group_id: int, group_df: pd.DataFrame) -> dict:
+    group_df = group_df.sort_values(by="X", ascending=True).copy()
+    texts = group_df["TEXT"].astype(str).map(safe_text).tolist()
+    joined = " | ".join(texts)
+
+    found = [kw for kw in BOM_HEADER_KEYWORDS if token_contains_any_keyword(joined, {kw})]
+    alias_found = [kw for kw in BOM_HEADER_ALIASES if token_contains_any_keyword(joined, {kw})]
+
+    keyword_count = len(set(found))
+    alias_count = len(set(alias_found))
+
+    confidence = keyword_count * 20
+    confidence += max(0, alias_count - keyword_count) * 8
+
+    if keyword_count >= 3:
+        confidence += 20
+
+    if "품번" in found and "품명" in found and "수량" in found:
+        confidence += 20
+
+    if "부품번호" in found or "도면번호" in found:
+        confidence += 10
+
+    return {
+        "DRAWING_FILE": drawing_file,
+        "PAGE_OR_LAYOUT": layout_name,
+        "HEADER_GROUP_ID": group_id,
+        "HEADER_Y_MEAN": float(group_df["Y"].mean()),
+        "HEADER_Y_MIN": float(group_df["Y"].min()),
+        "HEADER_Y_MAX": float(group_df["Y"].max()),
+        "HEADER_X_MIN": float(group_df["X"].min()),
+        "HEADER_X_MAX": float(group_df["X"].max()),
+        "HEADER_TEXT": joined,
+        "HEADER_KEYWORD_COUNT": keyword_count,
+        "HEADER_KEYWORDS_FOUND": ", ".join(sorted(set(found))),
+        "HEADER_CONFIDENCE": confidence,
+    }
+
+
+def build_header_row_candidates_from_text(text_df: pd.DataFrame) -> pd.DataFrame:
+    if text_df is None or text_df.empty:
+        return pd.DataFrame()
+
+    df = normalize_text_object_dataframe(text_df)
+    if df.empty:
+        return pd.DataFrame()
+
+    df["IS_HEADER_TOKEN"] = df["TEXT"].map(lambda x: token_contains_any_keyword(x, BOM_HEADER_ALIASES))
+    hdf = df[df["IS_HEADER_TOKEN"]].copy()
+
+    if hdf.empty:
+        return pd.DataFrame()
+
+    records = []
+
+    for (drawing_file, layout_name), area_df in hdf.groupby(["DRAWING_FILE", "PAGE_OR_LAYOUT"]):
+        all_area = df[(df["DRAWING_FILE"] == drawing_file) & (df["PAGE_OR_LAYOUT"] == layout_name)].copy()
+        y_tol = max(2.5, infer_area_height(all_area) * 1.25)
+
+        sorted_df = area_df.sort_values(by=["Y", "X"], ascending=[False, True]).copy()
+
+        current = []
+        current_y = None
+        group_id = 0
+
+        for idx, row in sorted_df.iterrows():
+            y = float(row["Y"])
+
+            if current_y is None:
+                current = [idx]
+                current_y = y
+            elif abs(y - current_y) <= y_tol:
+                current.append(idx)
+                current_y = (current_y * (len(current) - 1) + y) / len(current)
+            else:
+                group_id += 1
+                records.append(build_single_header_candidate_record(drawing_file, layout_name, group_id, sorted_df.loc[current].copy()))
+                current = [idx]
+                current_y = y
+
+        if current:
+            group_id += 1
+            records.append(build_single_header_candidate_record(drawing_file, layout_name, group_id, sorted_df.loc[current].copy()))
+
+    if not records:
+        return pd.DataFrame()
+
+    out = pd.DataFrame(records)
+    out = out[out["HEADER_CONFIDENCE"] >= 30].copy()
+    return out.reset_index(drop=True)
+
+
+def get_text_tokens_from_raw_text(raw_text: str) -> list:
+    raw = safe_text(raw_text)
+    if "|" in raw:
+        parts = raw.split("|")
+    else:
+        parts = raw.split()
+    return [safe_text(p) for p in parts if safe_text(p)]
+
+
+def extract_item_no_value_from_row(row: pd.Series):
+    value = row.get("ITEM_ANCHOR_VALUE", None)
+
+    try:
+        if pd.notna(value):
+            ivalue = int(value)
+            if ivalue > 0:
+                return ivalue
+    except Exception:
+        pass
+
+    texts = row.get("TEXTS", [])
+    if isinstance(texts, list) and texts:
+        first = safe_text(texts[0])
+        if first.isdigit():
+            try:
+                ivalue = int(first)
+                if ivalue > 0:
+                    return ivalue
+            except Exception:
+                pass
+
+    tokens = get_text_tokens_from_raw_text(row.get("RAW_ROW_TEXT", ""))
+    if tokens and tokens[0].isdigit():
+        try:
+            ivalue = int(tokens[0])
+            if ivalue > 0:
+                return ivalue
+        except Exception:
+            pass
+
+    return None
+
+
+def score_zone_rows(zone_rows: pd.DataFrame) -> dict:
+    if zone_rows is None or zone_rows.empty:
+        return {
+            "ROW_COUNT": 0,
+            "ITEM_NO_MIN": None,
+            "ITEM_NO_MAX": None,
+            "ITEM_NO_UNIQUE_COUNT": 0,
+            "SEQUENTIAL_SCORE": 0,
+            "ROW_DENSITY_SCORE": 0,
+        }
+
+    values = []
+    for _, row in zone_rows.iterrows():
+        v = extract_item_no_value_from_row(row)
+        if v is not None:
+            values.append(int(v))
+
+    unique = sorted(set(values))
+    sequential_score = 0
+
+    if unique:
+        span = max(unique) - min(unique) + 1
+        coverage = len(unique) / max(span, 1)
+
+        if len(unique) >= 3:
+            sequential_score += 20
+        if coverage >= 0.60:
+            sequential_score += 20
+        if len(unique) >= 8:
+            sequential_score += 15
+
+    row_density_score = 0
+    if len(zone_rows) >= 3:
+        row_density_score += 10
+    if len(zone_rows) >= 8:
+        row_density_score += 15
+    if len(zone_rows) >= 15:
+        row_density_score += 10
+
+    return {
+        "ROW_COUNT": len(zone_rows),
+        "ITEM_NO_MIN": min(unique) if unique else None,
+        "ITEM_NO_MAX": max(unique) if unique else None,
+        "ITEM_NO_UNIQUE_COUNT": len(unique),
+        "SEQUENTIAL_SCORE": sequential_score,
+        "ROW_DENSITY_SCORE": row_density_score,
+    }
+
+
+def build_bom_zone_candidates(text_df: pd.DataFrame, row_candidate_df: pd.DataFrame) -> pd.DataFrame:
+    columns = [
+        "DRAWING_FILE", "PAGE_OR_LAYOUT", "BOM_ZONE_ID",
+        "ZONE_X_MIN", "ZONE_X_MAX", "ZONE_Y_MIN", "ZONE_Y_MAX",
+        "HEADER_FOUND", "HEADER_TEXT", "HEADER_Y", "HEADER_X_MIN", "HEADER_X_MAX",
+        "ROW_COUNT", "ITEM_NO_MIN", "ITEM_NO_MAX", "ITEM_NO_UNIQUE_COUNT",
+        "HEADER_CONFIDENCE", "SEQUENTIAL_SCORE", "ROW_DENSITY_SCORE",
+        "ZONE_CONFIDENCE", "ZONE_REASON"
+    ]
+
+    if row_candidate_df is None or row_candidate_df.empty:
+        return pd.DataFrame(columns=columns)
+
+    header_df = build_header_row_candidates_from_text(text_df)
+    if header_df.empty:
+        return pd.DataFrame(columns=columns)
+
+    zones = []
+
+    for _, header in header_df.iterrows():
+        drawing_file = header["DRAWING_FILE"]
+        layout_name = header["PAGE_OR_LAYOUT"]
+
+        area_rows = row_candidate_df[
+            (row_candidate_df["DRAWING_FILE"] == drawing_file)
+            & (row_candidate_df["PAGE_OR_LAYOUT"] == layout_name)
+        ].copy()
+
+        if area_rows.empty:
+            continue
+
+        text_area = text_df[
+            (text_df["DRAWING_FILE"] == drawing_file)
+            & (text_df["PAGE_OR_LAYOUT"] == layout_name)
+        ].copy()
+
+        median_height = infer_area_height(text_area)
+
+        header_y = float(header["HEADER_Y_MEAN"])
+        header_x_min = float(header["HEADER_X_MIN"])
+        header_x_max = float(header["HEADER_X_MAX"])
+
+        x_min = header_x_min - BOM_ZONE_X_MARGIN
+        x_max = header_x_max + BOM_ZONE_X_MARGIN
+        y_min = header_y + max(1.0, median_height * BOM_ZONE_HEADER_Y_MARGIN_MULTIPLIER)
+        y_max = header_y + max(30.0, median_height * BOM_ZONE_MAX_VERTICAL_SPAN_MULTIPLIER)
+
+        row_y = pd.to_numeric(area_rows["ROW_Y_MEAN"], errors="coerce")
+        row_x_min = pd.to_numeric(area_rows["ROW_X_MIN"], errors="coerce")
+        row_x_max = pd.to_numeric(area_rows["ROW_X_MAX"], errors="coerce")
+
+        zone_rows = area_rows[
+            (row_y >= y_min)
+            & (row_y <= y_max)
+            & (
+                ((row_x_min >= x_min) & (row_x_min <= x_max))
+                | ((row_x_max >= x_min) & (row_x_max <= x_max))
+            )
+        ].copy()
+
+        score_info = score_zone_rows(zone_rows)
+
+        header_conf = int(header["HEADER_CONFIDENCE"])
+        sequential_score = int(score_info["SEQUENTIAL_SCORE"])
+        row_density_score = int(score_info["ROW_DENSITY_SCORE"])
+        zone_conf = min(100, header_conf + sequential_score + row_density_score)
+
+        reason = (
+            f"HEADER_CONFIDENCE={header_conf}; "
+            f"SEQUENTIAL_SCORE={sequential_score}; "
+            f"ROW_DENSITY_SCORE={row_density_score}; "
+            f"ROW_COUNT={score_info['ROW_COUNT']}"
+        )
+
+        zones.append({
+            "DRAWING_FILE": drawing_file,
+            "PAGE_OR_LAYOUT": layout_name,
+            "BOM_ZONE_ID": f"{drawing_file}::{layout_name}::HZ{int(header['HEADER_GROUP_ID']):03d}",
+            "ZONE_X_MIN": x_min,
+            "ZONE_X_MAX": x_max,
+            "ZONE_Y_MIN": y_min,
+            "ZONE_Y_MAX": y_max,
+            "HEADER_FOUND": True,
+            "HEADER_TEXT": header["HEADER_TEXT"],
+            "HEADER_Y": header_y,
+            "HEADER_X_MIN": header_x_min,
+            "HEADER_X_MAX": header_x_max,
+            "ROW_COUNT": score_info["ROW_COUNT"],
+            "ITEM_NO_MIN": score_info["ITEM_NO_MIN"],
+            "ITEM_NO_MAX": score_info["ITEM_NO_MAX"],
+            "ITEM_NO_UNIQUE_COUNT": score_info["ITEM_NO_UNIQUE_COUNT"],
+            "HEADER_CONFIDENCE": header_conf,
+            "SEQUENTIAL_SCORE": sequential_score,
+            "ROW_DENSITY_SCORE": row_density_score,
+            "ZONE_CONFIDENCE": zone_conf,
+            "ZONE_REASON": reason,
+        })
+
+    if not zones:
+        return pd.DataFrame(columns=columns)
+
+    out = pd.DataFrame(zones)
+    out = out[out["ZONE_CONFIDENCE"] >= BOM_ZONE_MIN_CONFIDENCE].copy()
+
+    if out.empty:
+        return pd.DataFrame(columns=columns)
+
+    out = out[columns].sort_values(
+        by=["DRAWING_FILE", "PAGE_OR_LAYOUT", "ZONE_CONFIDENCE", "ROW_COUNT"],
+        ascending=[True, True, False, False]
+    ).reset_index(drop=True)
+
+    out = expand_headerless_bom_zones(
+        bom_zone_df=out,
+        row_candidate_df=row_candidate_df
+    )
+
+    return out[columns].sort_values(
+        by=["DRAWING_FILE", "PAGE_OR_LAYOUT", "ZONE_CONFIDENCE", "ROW_COUNT"],
+        ascending=[True, True, False, False]
+    ).reset_index(drop=True)
+
+
+
+# ============================================================
+# Step 3.5: Headerless BOM_ZONE extension - Step 2
+# ============================================================
+
+def get_numeric_item_values_from_rows(rows_df: pd.DataFrame) -> list:
+    """
+    Extract item-number-like values from row candidates.
+    """
+    values = []
+
+    if rows_df is None or rows_df.empty:
+        return values
+
+    for _, row in rows_df.iterrows():
+        v = extract_item_no_value_from_row(row)
+        if v is None:
+            continue
+        try:
+            values.append(int(v))
+        except Exception:
+            pass
+
+    return values
+
+
+def calculate_y_overlap_ratio(zone_a: pd.Series, y_min: float, y_max: float) -> float:
+    """
+    Calculate vertical overlap between a reference zone and a candidate y span.
+    """
+    try:
+        ref_y_min = float(zone_a["ZONE_Y_MIN"])
+        ref_y_max = float(zone_a["ZONE_Y_MAX"])
+    except Exception:
+        return 0.0
+
+    overlap = max(0.0, min(ref_y_max, y_max) - max(ref_y_min, y_min))
+    ref_span = max(1.0, ref_y_max - ref_y_min)
+    return overlap / ref_span
+
+
+def row_is_inside_any_zone(row: pd.Series, zone_df: pd.DataFrame) -> bool:
+    """
+    Check whether a row is already covered by an existing BOM zone.
+    """
+    if zone_df is None or zone_df.empty:
+        return False
+
+    try:
+        row_y = float(row.get("ROW_Y_MEAN"))
+        row_x_min = float(row.get("ROW_X_MIN"))
+        row_x_max = float(row.get("ROW_X_MAX"))
+    except Exception:
+        return False
+
+    drawing_file = row.get("DRAWING_FILE")
+    layout_name = row.get("PAGE_OR_LAYOUT")
+
+    sub = zone_df[
+        (zone_df["DRAWING_FILE"] == drawing_file)
+        & (zone_df["PAGE_OR_LAYOUT"] == layout_name)
+    ]
+
+    if sub.empty:
+        return False
+
+    for _, z in sub.iterrows():
+        try:
+            z_x_min = float(z["ZONE_X_MIN"])
+            z_x_max = float(z["ZONE_X_MAX"])
+            z_y_min = float(z["ZONE_Y_MIN"])
+            z_y_max = float(z["ZONE_Y_MAX"])
+        except Exception:
+            continue
+
+        x_hit = (
+            (z_x_min <= row_x_min <= z_x_max)
+            or (z_x_min <= row_x_max <= z_x_max)
+            or (row_x_min <= z_x_min and row_x_max >= z_x_max)
+        )
+        y_hit = z_y_min <= row_y <= z_y_max
+
+        if x_hit and y_hit:
+            return True
+
+    return False
+
+
+def split_uncovered_rows_into_x_clusters(uncovered_df: pd.DataFrame) -> list:
+    """
+    Split uncovered row candidates by X position.
+
+    Headerless BOM tables often appear beside the headered BOM table.
+    This function is intentionally simple and diagnostic-friendly.
+    """
+    if uncovered_df is None or uncovered_df.empty:
+        return []
+
+    df = uncovered_df.copy()
+    df["ROW_X_MIN_NUM"] = pd.to_numeric(df["ROW_X_MIN"], errors="coerce")
+    df["ROW_X_MAX_NUM"] = pd.to_numeric(df["ROW_X_MAX"], errors="coerce")
+    df["ROW_Y_MEAN_NUM"] = pd.to_numeric(df["ROW_Y_MEAN"], errors="coerce")
+
+    df = df[
+        df["ROW_X_MIN_NUM"].notna()
+        & df["ROW_X_MAX_NUM"].notna()
+        & df["ROW_Y_MEAN_NUM"].notna()
+    ].copy()
+
+    if df.empty:
+        return []
+
+    df["ROW_X_CENTER_NUM"] = (df["ROW_X_MIN_NUM"] + df["ROW_X_MAX_NUM"]) / 2.0
+    df = df.sort_values(by=["ROW_X_CENTER_NUM", "ROW_Y_MEAN_NUM"], ascending=[True, False]).copy()
+
+    clusters = []
+    current_indices = []
+    current_center = None
+    current_count = 0
+
+    for idx, row in df.iterrows():
+        x_center = float(row["ROW_X_CENTER_NUM"])
+
+        if current_center is None:
+            current_indices = [idx]
+            current_center = x_center
+            current_count = 1
+            continue
+
+        if abs(x_center - current_center) <= HEADERLESS_ZONE_X_CLUSTER_GAP:
+            current_indices.append(idx)
+            current_center = (current_center * current_count + x_center) / (current_count + 1)
+            current_count += 1
+        else:
+            if current_indices:
+                clusters.append(df.loc[current_indices].copy())
+            current_indices = [idx]
+            current_center = x_center
+            current_count = 1
+
+    if current_indices:
+        clusters.append(df.loc[current_indices].copy())
+
+    return clusters
+
+
+def score_headerless_cluster(cluster_df: pd.DataFrame, reference_zone: pd.Series) -> dict:
+    """
+    Score a headerless row cluster as a BOM_ZONE extension candidate.
+
+    This is not final BOM judgment.
+    It only decides whether the cluster deserves BOM_ZONE membership for review.
+    """
+    if cluster_df is None or cluster_df.empty:
+        return {
+            "ROW_COUNT": 0,
+            "ITEM_NO_MIN": None,
+            "ITEM_NO_MAX": None,
+            "ITEM_NO_UNIQUE_COUNT": 0,
+            "SEQUENTIAL_SCORE": 0,
+            "ROW_DENSITY_SCORE": 0,
+            "Y_OVERLAP_SCORE": 0,
+            "WIDTH_SCORE": 0,
+            "HEADERLESS_CONFIDENCE": 0,
+            "ZONE_REASON": "EMPTY_CLUSTER",
+        }
+
+    row_count = len(cluster_df)
+    item_values = get_numeric_item_values_from_rows(cluster_df)
+    unique_values = sorted(set(item_values))
+
+    sequential_score = 0
+
+    if unique_values:
+        span = max(unique_values) - min(unique_values) + 1
+        coverage = len(unique_values) / max(span, 1)
+
+        if len(unique_values) >= 3:
+            sequential_score += 15
+        if coverage >= 0.50:
+            sequential_score += 15
+        if len(unique_values) >= 8:
+            sequential_score += 10
+
+    row_density_score = 0
+    if row_count >= 3:
+        row_density_score += 10
+    if row_count >= 8:
+        row_density_score += 10
+    if row_count >= 15:
+        row_density_score += 10
+
+    x_min = float(pd.to_numeric(cluster_df["ROW_X_MIN"], errors="coerce").min())
+    x_max = float(pd.to_numeric(cluster_df["ROW_X_MAX"], errors="coerce").max())
+    y_min = float(pd.to_numeric(cluster_df["ROW_Y_MIN"], errors="coerce").min())
+    y_max = float(pd.to_numeric(cluster_df["ROW_Y_MAX"], errors="coerce").max())
+
+    y_overlap_ratio = calculate_y_overlap_ratio(reference_zone, y_min, y_max)
+    y_overlap_score = 15 if y_overlap_ratio >= HEADERLESS_ZONE_Y_OVERLAP_RATIO_MIN else 0
+
+    width_score = 0
+    try:
+        ref_width = float(reference_zone["ZONE_X_MAX"]) - float(reference_zone["ZONE_X_MIN"])
+        cluster_width = x_max - x_min
+        if ref_width > 0 and cluster_width > 0:
+            width_ratio = cluster_width / ref_width
+            if 0.20 <= width_ratio <= HEADERLESS_ZONE_MAX_WIDTH_RATIO:
+                width_score = 10
+    except Exception:
+        pass
+
+    # Baseline 10: cluster exists and is near a known zone.
+    confidence = min(
+        100,
+        10 + sequential_score + row_density_score + y_overlap_score + width_score
+    )
+
+    reason = (
+        "HEADERLESS_PATTERN_EXTENSION; "
+        f"ROW_COUNT={row_count}; "
+        f"SEQUENTIAL_SCORE={sequential_score}; "
+        f"ROW_DENSITY_SCORE={row_density_score}; "
+        f"Y_OVERLAP_SCORE={y_overlap_score}; "
+        f"WIDTH_SCORE={width_score}"
+    )
+
+    return {
+        "ROW_COUNT": row_count,
+        "ITEM_NO_MIN": min(unique_values) if unique_values else None,
+        "ITEM_NO_MAX": max(unique_values) if unique_values else None,
+        "ITEM_NO_UNIQUE_COUNT": len(unique_values),
+        "SEQUENTIAL_SCORE": sequential_score,
+        "ROW_DENSITY_SCORE": row_density_score,
+        "Y_OVERLAP_SCORE": y_overlap_score,
+        "WIDTH_SCORE": width_score,
+        "HEADERLESS_CONFIDENCE": confidence,
+        "ZONE_REASON": reason,
+    }
+
+
+def expand_headerless_bom_zones(bom_zone_df: pd.DataFrame, row_candidate_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Add headerless BOM zone candidates based on row-pattern clusters.
+
+    This handles BOM tables where only the first table has the header.
+    """
+    if bom_zone_df is None or bom_zone_df.empty:
+        return bom_zone_df
+
+    if row_candidate_df is None or row_candidate_df.empty:
+        return bom_zone_df
+
+    base_columns = list(bom_zone_df.columns)
+    new_zones = []
+
+    existing_zones = bom_zone_df.copy()
+
+    for _, ref_zone in bom_zone_df.iterrows():
+        drawing_file = ref_zone["DRAWING_FILE"]
+        layout_name = ref_zone["PAGE_OR_LAYOUT"]
+
+        area_rows = row_candidate_df[
+            (row_candidate_df["DRAWING_FILE"] == drawing_file)
+            & (row_candidate_df["PAGE_OR_LAYOUT"] == layout_name)
+        ].copy()
+
+        if area_rows.empty:
+            continue
+
+        if "ROOT_FLAG" in area_rows.columns:
+            area_rows = area_rows[~area_rows["ROOT_FLAG"].fillna(False).astype(bool)].copy()
+
+        if area_rows.empty:
+            continue
+
+        # Keep rows that are near the vertical span of the known headered zone.
+        try:
+            ref_y_min = float(ref_zone["ZONE_Y_MIN"])
+            ref_y_max = float(ref_zone["ZONE_Y_MAX"])
+            ref_span = max(1.0, ref_y_max - ref_y_min)
+            y_lower = ref_y_min - ref_span * HEADERLESS_ZONE_REFERENCE_Y_MARGIN_RATIO
+            y_upper = ref_y_max + ref_span * HEADERLESS_ZONE_REFERENCE_Y_MARGIN_RATIO
+
+            area_rows = area_rows[
+                (pd.to_numeric(area_rows["ROW_Y_MEAN"], errors="coerce") >= y_lower)
+                & (pd.to_numeric(area_rows["ROW_Y_MEAN"], errors="coerce") <= y_upper)
+            ].copy()
+        except Exception:
+            pass
+
+        if area_rows.empty:
+            continue
+
+        uncovered_records = []
+
+        for _, row in area_rows.iterrows():
+            if not row_is_inside_any_zone(row, existing_zones):
+                uncovered_records.append(row)
+
+        if not uncovered_records:
+            continue
+
+        uncovered_df = pd.DataFrame(uncovered_records)
+
+        clusters = split_uncovered_rows_into_x_clusters(uncovered_df)
+
+        extension_index = 0
+
+        for cluster in clusters:
+            if cluster is None or cluster.empty:
+                continue
+
+            if len(cluster) < HEADERLESS_ZONE_MIN_ROW_COUNT:
+                continue
+
+            score = score_headerless_cluster(cluster, ref_zone)
+
+            if score["HEADERLESS_CONFIDENCE"] < HEADERLESS_ZONE_MIN_CONFIDENCE:
+                continue
+
+            extension_index += 1
+
+            x_min = float(pd.to_numeric(cluster["ROW_X_MIN"], errors="coerce").min()) - BOM_ZONE_X_MARGIN
+            x_max = float(pd.to_numeric(cluster["ROW_X_MAX"], errors="coerce").max()) + BOM_ZONE_X_MARGIN
+            y_min = float(pd.to_numeric(cluster["ROW_Y_MIN"], errors="coerce").min()) - 2.0
+            y_max = float(pd.to_numeric(cluster["ROW_Y_MAX"], errors="coerce").max()) + 2.0
+
+            zone_id = f"{drawing_file}::{layout_name}::HLZ{extension_index:03d}"
+
+            new_zones.append({
+                "DRAWING_FILE": drawing_file,
+                "PAGE_OR_LAYOUT": layout_name,
+                "BOM_ZONE_ID": zone_id,
+                "ZONE_X_MIN": x_min,
+                "ZONE_X_MAX": x_max,
+                "ZONE_Y_MIN": y_min,
+                "ZONE_Y_MAX": y_max,
+                "HEADER_FOUND": False,
+                "HEADER_TEXT": "",
+                "HEADER_Y": None,
+                "HEADER_X_MIN": None,
+                "HEADER_X_MAX": None,
+                "ROW_COUNT": score["ROW_COUNT"],
+                "ITEM_NO_MIN": score["ITEM_NO_MIN"],
+                "ITEM_NO_MAX": score["ITEM_NO_MAX"],
+                "ITEM_NO_UNIQUE_COUNT": score["ITEM_NO_UNIQUE_COUNT"],
+                "HEADER_CONFIDENCE": 0,
+                "SEQUENTIAL_SCORE": score["SEQUENTIAL_SCORE"],
+                "ROW_DENSITY_SCORE": score["ROW_DENSITY_SCORE"],
+                "ZONE_CONFIDENCE": score["HEADERLESS_CONFIDENCE"],
+                "ZONE_REASON": score["ZONE_REASON"],
+            })
+
+    if not new_zones:
+        return bom_zone_df
+
+    extension_df = pd.DataFrame(new_zones)
+
+    for col in base_columns:
+        if col not in extension_df.columns:
+            extension_df[col] = None
+
+    extension_df = extension_df[base_columns]
+
+    out = pd.concat([bom_zone_df, extension_df], ignore_index=True)
+
+    # Simple deduplication by rounded geometry.
+    out["_GEOM_KEY"] = (
+        out["DRAWING_FILE"].astype(str) + "||" +
+        out["PAGE_OR_LAYOUT"].astype(str) + "||" +
+        pd.to_numeric(out["ZONE_X_MIN"], errors="coerce").round(1).astype(str) + "||" +
+        pd.to_numeric(out["ZONE_X_MAX"], errors="coerce").round(1).astype(str) + "||" +
+        pd.to_numeric(out["ZONE_Y_MIN"], errors="coerce").round(1).astype(str) + "||" +
+        pd.to_numeric(out["ZONE_Y_MAX"], errors="coerce").round(1).astype(str)
+    )
+
+    out = out.sort_values(
+        by=["DRAWING_FILE", "PAGE_OR_LAYOUT", "ZONE_CONFIDENCE", "ROW_COUNT"],
+        ascending=[True, True, False, False],
+        na_position="last"
+    ).drop_duplicates(subset=["_GEOM_KEY"], keep="first").drop(columns=["_GEOM_KEY"])
+
+    return out.reset_index(drop=True)
+
+
+def assign_bom_zone_to_row_candidates(row_candidate_df: pd.DataFrame, bom_zone_df: pd.DataFrame) -> pd.DataFrame:
+    if row_candidate_df is None:
+        return pd.DataFrame()
+
+    df = row_candidate_df.copy()
+
+    df["IS_IN_BOM_ZONE"] = False
+    df["BOM_ZONE_ID"] = None
+    df["BOM_ZONE_CONFIDENCE"] = None
+    df["BOM_ZONE_REASON"] = None
+    df["DISTANCE_TO_HEADER"] = None
+
+    if bom_zone_df is None or bom_zone_df.empty or df.empty:
+        # ROOT rows are always retained.
+        if "ROOT_FLAG" in df.columns:
+            root_mask = df["ROOT_FLAG"].fillna(False).astype(bool)
+            df.loc[root_mask, "IS_IN_BOM_ZONE"] = True
+            df.loc[root_mask, "BOM_ZONE_ID"] = "ROOT"
+            df.loc[root_mask, "BOM_ZONE_CONFIDENCE"] = 100
+            df.loc[root_mask, "BOM_ZONE_REASON"] = "ROOT_ROW_BYPASS"
+        return df
+
+    row_y = pd.to_numeric(df["ROW_Y_MEAN"], errors="coerce")
+    row_x_min = pd.to_numeric(df["ROW_X_MIN"], errors="coerce")
+    row_x_max = pd.to_numeric(df["ROW_X_MAX"], errors="coerce")
+
+    for _, zone in bom_zone_df.iterrows():
+        drawing_file = zone["DRAWING_FILE"]
+        layout_name = zone["PAGE_OR_LAYOUT"]
+
+        z_x_min = float(zone["ZONE_X_MIN"])
+        z_x_max = float(zone["ZONE_X_MAX"])
+        z_y_min = float(zone["ZONE_Y_MIN"])
+        z_y_max = float(zone["ZONE_Y_MAX"])
+
+        mask = (
+            (df["DRAWING_FILE"] == drawing_file)
+            & (df["PAGE_OR_LAYOUT"] == layout_name)
+            & (row_y >= z_y_min)
+            & (row_y <= z_y_max)
+            & (
+                ((row_x_min >= z_x_min) & (row_x_min <= z_x_max))
+                | ((row_x_max >= z_x_min) & (row_x_max <= z_x_max))
+            )
+        )
+
+        df.loc[mask, "IS_IN_BOM_ZONE"] = True
+        df.loc[mask, "BOM_ZONE_ID"] = zone["BOM_ZONE_ID"]
+        df.loc[mask, "BOM_ZONE_CONFIDENCE"] = zone["ZONE_CONFIDENCE"]
+        df.loc[mask, "BOM_ZONE_REASON"] = zone["ZONE_REASON"]
+        df.loc[mask, "DISTANCE_TO_HEADER"] = row_y[mask] - float(zone["HEADER_Y"])
+
+    if "ROOT_FLAG" in df.columns:
+        root_mask = df["ROOT_FLAG"].fillna(False).astype(bool)
+        df.loc[root_mask, "IS_IN_BOM_ZONE"] = True
+        df.loc[root_mask, "BOM_ZONE_ID"] = "ROOT"
+        df.loc[root_mask, "BOM_ZONE_CONFIDENCE"] = 100
+        df.loc[root_mask, "BOM_ZONE_REASON"] = "ROOT_ROW_BYPASS"
+
+    return df
+
+
+# ============================================================
+# Step 4: Diagnostics and export
+# ============================================================
+
+def build_row_candidate_diagnostics(text_df: pd.DataFrame, row_candidate_df: pd.DataFrame) -> pd.DataFrame:
+    if row_candidate_df is None or row_candidate_df.empty:
+        return pd.DataFrame([{"NOTE": "No row candidates"}])
+
+    rows = []
+
+    for (drawing_file, layout_name), rc in row_candidate_df.groupby(["DRAWING_FILE", "PAGE_OR_LAYOUT"], dropna=False):
+        row_count = len(rc)
+        root_count = int(rc["ROOT_FLAG"].fillna(False).astype(bool).sum()) if "ROOT_FLAG" in rc.columns else 0
+        rowspan_count = int(rc["ROWSPAN_EXPANDED"].fillna(False).astype(bool).sum()) if "ROWSPAN_EXPANDED" in rc.columns else 0
+        orphan_count = int(rc["ORPHAN_RESCUE_FLAG"].fillna(False).astype(bool).sum()) if "ORPHAN_RESCUE_FLAG" in rc.columns else 0
+        merge_count = int(rc["FRAGMENT_MERGE_FLAG"].fillna(False).astype(bool).sum()) if "FRAGMENT_MERGE_FLAG" in rc.columns else 0
+        in_zone_count = int(rc["IS_IN_BOM_ZONE"].fillna(False).astype(bool).sum()) if "IS_IN_BOM_ZONE" in rc.columns else 0
+
+        rows.append({
+            "DRAWING_FILE": drawing_file,
+            "PAGE_OR_LAYOUT": layout_name,
+            "ROW_CANDIDATE_COUNT": row_count,
+            "ROOT_ROW_COUNT": root_count,
+            "ROWSPAN_EXPANDED_ROW_COUNT": rowspan_count,
+            "ORPHAN_RESCUE_ROW_COUNT": orphan_count,
+            "FRAGMENT_MERGE_ROW_COUNT": merge_count,
+            "ROW_IN_BOM_ZONE_COUNT": in_zone_count,
+            "SEGMENT_METHODS": ", ".join(sorted(rc["SEGMENT_METHOD"].dropna().astype(str).unique())) if "SEGMENT_METHOD" in rc.columns else "",
+        })
+
+    return pd.DataFrame(rows)
+
+
+
+# ============================================================
+# Step 4.5: BOM_ZONE validation sheets - Step 3
+# ============================================================
+
+def build_bom_zone_row_summary(row_candidate_df: pd.DataFrame, bom_zone_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Summarize ROW_CANDIDATES assigned to each BOM zone.
+
+    This is diagnostic only. It does not decide final BOM_TRUE/BOM_FALSE.
+    """
+    columns = [
+        "BOM_ZONE_ID", "DRAWING_FILE", "PAGE_OR_LAYOUT",
+        "HEADER_FOUND", "ZONE_CONFIDENCE", "ZONE_REASON",
+        "ZONE_ROW_COUNT", "ROOT_ROW_COUNT",
+        "ITEM_ANCHOR_ROW_COUNT", "ROWSPAN_EXPANDED_ROW_COUNT",
+        "ORPHAN_RESCUE_ROW_COUNT", "FRAGMENT_MERGE_ROW_COUNT",
+        "ITEM_NO_MIN_IN_ROWS", "ITEM_NO_MAX_IN_ROWS", "ITEM_NO_UNIQUE_COUNT_IN_ROWS",
+        "SEGMENT_METHODS", "RAW_ROW_SAMPLE"
+    ]
+
+    if row_candidate_df is None or row_candidate_df.empty:
+        return pd.DataFrame(columns=columns)
+
+    if bom_zone_df is None or bom_zone_df.empty:
+        return pd.DataFrame(columns=columns)
+
+    df = row_candidate_df.copy()
+
+    if "BOM_ZONE_ID" not in df.columns:
+        return pd.DataFrame(columns=columns)
+
+    records = []
+
+    for _, zone in bom_zone_df.iterrows():
+        zone_id = zone.get("BOM_ZONE_ID")
+        zone_rows = df[df["BOM_ZONE_ID"].astype(str) == str(zone_id)].copy()
+
+        values = []
+        for _, row in zone_rows.iterrows():
+            v = extract_item_no_value_from_row(row)
+            if v is not None:
+                try:
+                    values.append(int(v))
+                except Exception:
+                    pass
+
+        unique_values = sorted(set(values))
+
+        root_count = int(zone_rows["ROOT_FLAG"].fillna(False).astype(bool).sum()) if "ROOT_FLAG" in zone_rows.columns and not zone_rows.empty else 0
+        rowspan_count = int(zone_rows["ROWSPAN_EXPANDED"].fillna(False).astype(bool).sum()) if "ROWSPAN_EXPANDED" in zone_rows.columns and not zone_rows.empty else 0
+        orphan_count = int(zone_rows["ORPHAN_RESCUE_FLAG"].fillna(False).astype(bool).sum()) if "ORPHAN_RESCUE_FLAG" in zone_rows.columns and not zone_rows.empty else 0
+        merge_count = int(zone_rows["FRAGMENT_MERGE_FLAG"].fillna(False).astype(bool).sum()) if "FRAGMENT_MERGE_FLAG" in zone_rows.columns and not zone_rows.empty else 0
+
+        item_anchor_count = 0
+        if "ITEM_ANCHOR_VALUE" in zone_rows.columns and not zone_rows.empty:
+            item_anchor_count = int(pd.to_numeric(zone_rows["ITEM_ANCHOR_VALUE"], errors="coerce").notna().sum())
+
+        raw_samples = []
+        if not zone_rows.empty and "RAW_ROW_TEXT" in zone_rows.columns:
+            raw_samples = zone_rows["RAW_ROW_TEXT"].dropna().astype(str).head(5).tolist()
+
+        records.append({
+            "BOM_ZONE_ID": zone_id,
+            "DRAWING_FILE": zone.get("DRAWING_FILE"),
+            "PAGE_OR_LAYOUT": zone.get("PAGE_OR_LAYOUT"),
+            "HEADER_FOUND": zone.get("HEADER_FOUND"),
+            "ZONE_CONFIDENCE": zone.get("ZONE_CONFIDENCE"),
+            "ZONE_REASON": zone.get("ZONE_REASON"),
+            "ZONE_ROW_COUNT": len(zone_rows),
+            "ROOT_ROW_COUNT": root_count,
+            "ITEM_ANCHOR_ROW_COUNT": item_anchor_count,
+            "ROWSPAN_EXPANDED_ROW_COUNT": rowspan_count,
+            "ORPHAN_RESCUE_ROW_COUNT": orphan_count,
+            "FRAGMENT_MERGE_ROW_COUNT": merge_count,
+            "ITEM_NO_MIN_IN_ROWS": min(unique_values) if unique_values else None,
+            "ITEM_NO_MAX_IN_ROWS": max(unique_values) if unique_values else None,
+            "ITEM_NO_UNIQUE_COUNT_IN_ROWS": len(unique_values),
+            "SEGMENT_METHODS": ", ".join(sorted(zone_rows["SEGMENT_METHOD"].dropna().astype(str).unique())) if "SEGMENT_METHOD" in zone_rows.columns and not zone_rows.empty else "",
+            "RAW_ROW_SAMPLE": " || ".join(raw_samples),
+        })
+
+    return pd.DataFrame(records, columns=columns)
+
+
+def split_rows_by_bom_zone_membership(row_candidate_df: pd.DataFrame) -> tuple:
+    """
+    Split ROW_CANDIDATES into inside/outside/root diagnostic dataframes.
+    """
+    if row_candidate_df is None or row_candidate_df.empty:
+        empty = pd.DataFrame()
+        return empty, empty, empty
+
+    df = row_candidate_df.copy()
+
+    if "IS_IN_BOM_ZONE" not in df.columns:
+        df["IS_IN_BOM_ZONE"] = False
+
+    if "ROOT_FLAG" not in df.columns:
+        df["ROOT_FLAG"] = False
+
+    root_mask = df["ROOT_FLAG"].fillna(False).astype(bool)
+    in_zone_mask = df["IS_IN_BOM_ZONE"].fillna(False).astype(bool)
+
+    root_rows = df[root_mask].copy()
+    inside_rows = df[in_zone_mask & ~root_mask].copy()
+    outside_rows = df[~in_zone_mask & ~root_mask].copy()
+
+    return inside_rows.reset_index(drop=True), outside_rows.reset_index(drop=True), root_rows.reset_index(drop=True)
+
+
+def build_outside_zone_debug_summary(outside_rows: pd.DataFrame) -> pd.DataFrame:
+    """
+    Summarize outside-zone rows to help check whether real BOM rows are being missed.
+    """
+    columns = [
+        "DRAWING_FILE", "PAGE_OR_LAYOUT",
+        "OUTSIDE_ROW_COUNT",
+        "ITEM_ANCHOR_OUTSIDE_COUNT",
+        "ROWSPAN_OUTSIDE_COUNT",
+        "ORPHAN_OUTSIDE_COUNT",
+        "MERGE_OUTSIDE_COUNT",
+        "SEGMENT_METHODS",
+        "RAW_ROW_SAMPLE"
+    ]
+
+    if outside_rows is None or outside_rows.empty:
+        return pd.DataFrame(columns=columns)
+
+    records = []
+
+    for (drawing_file, layout_name), g in outside_rows.groupby(["DRAWING_FILE", "PAGE_OR_LAYOUT"], dropna=False):
+        item_anchor_count = int(pd.to_numeric(g.get("ITEM_ANCHOR_VALUE"), errors="coerce").notna().sum()) if "ITEM_ANCHOR_VALUE" in g.columns else 0
+        rowspan_count = int(g["ROWSPAN_EXPANDED"].fillna(False).astype(bool).sum()) if "ROWSPAN_EXPANDED" in g.columns else 0
+        orphan_count = int(g["ORPHAN_RESCUE_FLAG"].fillna(False).astype(bool).sum()) if "ORPHAN_RESCUE_FLAG" in g.columns else 0
+        merge_count = int(g["FRAGMENT_MERGE_FLAG"].fillna(False).astype(bool).sum()) if "FRAGMENT_MERGE_FLAG" in g.columns else 0
+
+        samples = g["RAW_ROW_TEXT"].dropna().astype(str).head(10).tolist() if "RAW_ROW_TEXT" in g.columns else []
+
+        records.append({
+            "DRAWING_FILE": drawing_file,
+            "PAGE_OR_LAYOUT": layout_name,
+            "OUTSIDE_ROW_COUNT": len(g),
+            "ITEM_ANCHOR_OUTSIDE_COUNT": item_anchor_count,
+            "ROWSPAN_OUTSIDE_COUNT": rowspan_count,
+            "ORPHAN_OUTSIDE_COUNT": orphan_count,
+            "MERGE_OUTSIDE_COUNT": merge_count,
+            "SEGMENT_METHODS": ", ".join(sorted(g["SEGMENT_METHOD"].dropna().astype(str).unique())) if "SEGMENT_METHOD" in g.columns else "",
+            "RAW_ROW_SAMPLE": " || ".join(samples),
+        })
+
+    return pd.DataFrame(records, columns=columns)
+
+
+def build_header_anchor_candidates_sheet(text_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Expose header candidates used by BOM_ZONE detection for easier validation.
+    """
+    try:
+        out = build_header_row_candidates_from_text(text_df)
+    except Exception as exc:
+        return pd.DataFrame([{
+            "ERROR": f"{type(exc).__name__}: {exc}"
+        }])
+
+    return out
+
+
+
+# ============================================================
+# Step 5: BOM judgment with BOM_ZONE positive gating - Step 4
+# ============================================================
+
+BOM_TRUE_SCORE_THRESHOLD = 70
+BOM_REVIEW_SCORE_THRESHOLD = 45
+
+
+def row_text_tokens(row: pd.Series) -> list:
+    """
+    Return row text tokens from TEXTS or RAW_ROW_TEXT.
+    """
+    texts = row.get("TEXTS", [])
+
+    if isinstance(texts, list):
+        return [safe_text(t) for t in texts if safe_text(t)]
+
+    raw = safe_text(row.get("RAW_ROW_TEXT", ""))
+    if "|" in raw:
+        return [safe_text(x) for x in raw.split("|") if safe_text(x)]
+
+    return [safe_text(x) for x in raw.split() if safe_text(x)]
+
+
+def is_header_like_row(tokens: list) -> bool:
+    """
+    Prevent BOM header rows from becoming BOM_TRUE.
+    """
+    if not tokens:
+        return False
+
+    joined = " ".join(tokens)
+    hit_count = 0
+
+    for kw in BOM_HEADER_ALIASES:
+        if token_contains_any_keyword(joined, {kw}):
+            hit_count += 1
+
+    if hit_count >= 2:
+        return True
+
+    if "부품기호" in joined and "실장" in joined:
+        return True
+
+    return False
+
+
+def count_qty_like_tokens(tokens: list) -> int:
+    return sum(1 for t in tokens if looks_like_qty(t))
+
+
+def count_part_no_like_tokens(tokens: list) -> int:
+    return sum(1 for t in tokens if looks_like_part_no(t))
+
+
+def count_maker_like_tokens(tokens: list) -> int:
+    return sum(1 for t in tokens if looks_like_maker_text(t))
+
+
+def has_item_anchor_signal(row: pd.Series, tokens: list) -> bool:
+    """
+    Check whether row has a usable item-number anchor.
+    """
+    value = extract_item_no_value_from_row(row)
+    if value is not None:
+        return True
+
+    if tokens and looks_like_item_no(tokens[0]):
+        return True
+
+    return False
+
+
+def calculate_zone_gated_bom_score(row: pd.Series) -> tuple:
+    """
+    Calculate a conservative BOM score for rows already inside BOM_ZONE.
+
+    Important:
+    - This function is used only after IS_IN_BOM_ZONE positive gating.
+    - It should not be a blacklist-heavy classifier.
+    """
+
+    tokens = row_text_tokens(row)
+    reasons = []
+    score = 0
+
+    if not tokens:
+        return 0, "EMPTY_ROW"
+
+    if is_header_like_row(tokens):
+        return 0, "HEADER_ROW_NOT_BOM"
+
+    if has_item_anchor_signal(row, tokens):
+        score += 30
+        reasons.append("ITEM_ANCHOR")
+
+    if len(tokens) >= 3:
+        score += 10
+        reasons.append("TOKEN_COUNT_GE_3")
+
+    if len(tokens) >= 5:
+        score += 5
+        reasons.append("TOKEN_COUNT_GE_5")
+
+    qty_count = count_qty_like_tokens(tokens)
+    if qty_count >= 1:
+        score += 15
+        reasons.append("QTY_FOUND")
+
+    part_no_count = count_part_no_like_tokens(tokens)
+    if part_no_count >= 1:
+        score += 20
+        reasons.append("PART_NO_FOUND")
+
+    maker_count = count_maker_like_tokens(tokens)
+    if maker_count >= 1:
+        score += 15
+        reasons.append("MAKER_FOUND")
+
+    segment_method = safe_text(row.get("SEGMENT_METHOD", ""))
+
+    if segment_method == "LEFT_RIGHT_FRAGMENT_MERGE":
+        score += 15
+        reasons.append("LEFT_RIGHT_FRAGMENT_MERGE")
+
+    if bool(row.get("ROWSPAN_EXPANDED", False)):
+        score += 10
+        reasons.append("ROWSPAN_EXPANDED")
+
+    if bool(row.get("ORPHAN_RESCUE_FLAG", False)):
+        score += 5
+        reasons.append("ORPHAN_RESCUE")
+
+    zone_conf = to_float(row.get("BOM_ZONE_CONFIDENCE"), 0)
+    if zone_conf is not None and zone_conf >= 70:
+        score += 10
+        reasons.append("HIGH_CONFIDENCE_ZONE")
+    elif zone_conf is not None and zone_conf >= 55:
+        score += 5
+        reasons.append("MEDIUM_CONFIDENCE_ZONE")
+
+    # If row is inside a zone but has no item anchor and no part number,
+    # keep it conservative.
+    if not has_item_anchor_signal(row, tokens) and part_no_count == 0:
+        score = min(score, 40)
+        reasons.append("NO_ITEM_ANCHOR_AND_NO_PART_NO_CAP")
+
+    return score, "; ".join(reasons) if reasons else "NO_STRONG_BOM_SIGNAL"
+
+
+def judge_single_zone_gated_row(row: pd.Series) -> tuple:
+    """
+    Judge one row using positive gating.
+
+    Rules:
+    - ROOT rows are TRUE.
+    - Outside BOM_ZONE cannot become TRUE.
+    - Inside BOM_ZONE uses conservative structural score.
+    """
+    if bool(row.get("ROOT_FLAG", False)):
+        return "TRUE", 100, "ROOT_ROW_BYPASS"
+
+    is_in_zone = bool(row.get("IS_IN_BOM_ZONE", False))
+
+    if not is_in_zone:
+        return "FALSE", 0, "OUTSIDE_BOM_ZONE_TRUE_FORBIDDEN"
+
+    score, reason = calculate_zone_gated_bom_score(row)
+
+    if score >= BOM_TRUE_SCORE_THRESHOLD:
+        return "TRUE", score, "ZONE_GATED_TRUE; " + reason
+
+    if score >= BOM_REVIEW_SCORE_THRESHOLD:
+        return "REVIEW", score, "ZONE_GATED_REVIEW; " + reason
+
+    return "FALSE", score, "INSIDE_ZONE_BUT_WEAK_BOM_STRUCTURE; " + reason
+
+
+def build_zone_gated_bom_judgment(row_candidate_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Build BOM_JUDGED_ROWS from ROW_CANDIDATES.
+    """
+    if row_candidate_df is None or row_candidate_df.empty:
+        return pd.DataFrame()
+
+    df = row_candidate_df.copy()
+
+    results = []
+
+    for _, row in df.iterrows():
+        result, score, reason = judge_single_zone_gated_row(row)
+        results.append((result, score, reason))
+
+    df["BOM_JUDGE_RESULT"] = [r[0] for r in results]
+    df["BOM_JUDGE_SCORE"] = [r[1] for r in results]
+    df["BOM_JUDGE_REASON"] = [r[2] for r in results]
+
+    return df
+
+
+def split_bom_judged_rows(bom_judged_df: pd.DataFrame) -> tuple:
+    """
+    Split BOM_JUDGED_ROWS into TRUE / REVIEW / FALSE.
+    """
+    if bom_judged_df is None or bom_judged_df.empty:
+        empty = pd.DataFrame()
+        return empty, empty, empty
+
+    true_df = bom_judged_df[bom_judged_df["BOM_JUDGE_RESULT"] == "TRUE"].copy()
+    review_df = bom_judged_df[bom_judged_df["BOM_JUDGE_RESULT"] == "REVIEW"].copy()
+    false_df = bom_judged_df[bom_judged_df["BOM_JUDGE_RESULT"] == "FALSE"].copy()
+
+    return (
+        true_df.reset_index(drop=True),
+        review_df.reset_index(drop=True),
+        false_df.reset_index(drop=True),
+    )
+
+
+
+# ============================================================
+# Step 6: BOM_RAW parsing and normalization - Step 5
+# ============================================================
+
+BOM_RAW_PARSE_CONFIDENCE_TRUE = 70
+BOM_RAW_PARSE_CONFIDENCE_REVIEW = 45
+
+
+def normalize_part_no_basic(text: str) -> str:
+    """
+    Normalize part number candidate lightly.
+
+    This is intentionally conservative.
+    """
+    token = safe_text(text)
+    if not token:
+        return ""
+
+    token = token.strip()
+    token = token.strip(",;")
+    token = token.replace(" ", "")
+    return token
+
+
+def normalize_maker_basic(text: str) -> str:
+    """
+    Normalize maker candidate lightly.
+    """
+    token = safe_text(text)
+    if not token:
+        return ""
+    return token.strip().strip(",;")
+
+
+def is_root_bom_true_row(row: pd.Series) -> bool:
+    """
+    Detect intentionally injected ROOT row.
+    """
+    if bool(row.get("ROOT_FLAG", False)):
+        return True
+
+    tokens = row_text_tokens(row)
+    return len(tokens) >= 5 and tokens[0] == "ROOT" and "DRAWING_SELF" in tokens[-1]
+
+
+def parse_root_row_to_bom_raw(row: pd.Series) -> dict:
+    """
+    Convert ROOT row into BOM_RAW schema.
+    """
+    tokens = row_text_tokens(row)
+
+    root_part_no = safe_text(row.get("ROOT_PART_NO", ""))
+
+    if not root_part_no and len(tokens) >= 4:
+        root_part_no = safe_text(tokens[3])
+
+    source_file = safe_text(row.get("DRAWING_FILE", ""))
+    source_files = safe_text(row.get("ROOT_SOURCE_FILES", ""))
+
+    return {
+        "DRAWING_FILE": source_file,
+        "PAGE_OR_LAYOUT": safe_text(row.get("PAGE_OR_LAYOUT", "")),
+        "ITEM_NO": "ROOT",
+        "PART_NAME": "ROOT_DRAWING_SELF",
+        "QTY": 1,
+        "PART_NO": root_part_no,
+        "MAKER": "DRAWING_SELF",
+        "SOURCE_ROW_ID": safe_text(row.get("ROW_ID", "")),
+        "SOURCE_RAW_ROW_TEXT": safe_text(row.get("RAW_ROW_TEXT", "")),
+        "SOURCE_SEGMENT_METHOD": safe_text(row.get("SEGMENT_METHOD", "")),
+        "BOM_ZONE_ID": safe_text(row.get("BOM_ZONE_ID", "")),
+        "BOM_ZONE_CONFIDENCE": row.get("BOM_ZONE_CONFIDENCE", None),
+        "BOM_JUDGE_SCORE": row.get("BOM_JUDGE_SCORE", None),
+        "BOM_JUDGE_REASON": safe_text(row.get("BOM_JUDGE_REASON", "")),
+        "PARSE_METHOD": "ROOT_DRAWING_SELF",
+        "PARSE_CONFIDENCE": 100,
+        "PARSE_REASON": f"ROOT_SOURCE_FILES={source_files}",
+        "PARSE_REVIEW_FLAG": False,
+    }
+
+
+def first_item_no_from_tokens_or_row(row: pd.Series, tokens: list):
+    """
+    Return item number from row anchor or first token.
+    """
+    value = extract_item_no_value_from_row(row)
+    if value is not None:
+        return str(value)
+
+    if tokens and looks_like_item_no(tokens[0]):
+        return safe_text(tokens[0])
+
+    return ""
+
+
+def find_qty_index(tokens: list) -> int:
+    """
+    Choose quantity index.
+
+    Heuristic:
+    - Prefer numeric token after the first token.
+    - In common BOM rows: item_no | part_name | qty | part_no | maker
+    """
+    if not tokens:
+        return -1
+
+    candidates = []
+
+    for i, token in enumerate(tokens):
+        if i == 0 and looks_like_item_no(token):
+            continue
+
+        if looks_like_qty(token):
+            try:
+                value = int(safe_text(token))
+            except Exception:
+                value = -1
+
+            # Quantity is usually small but allow broad range.
+            if 0 <= value <= 9999:
+                candidates.append(i)
+
+    if not candidates:
+        return -1
+
+    # Prefer a qty token that has text before and part-no-like token after.
+    for i in candidates:
+        left_exists = i >= 1
+        right_part_no = any(looks_like_part_no(t) for t in tokens[i + 1:])
+        if left_exists and right_part_no:
+            return i
+
+    # Otherwise choose the second/third token-ish position.
+    return candidates[0]
+
+
+def find_part_no_index(tokens: list, start_index: int = 0) -> int:
+    """
+    Find first part-number-like token at or after start_index.
+    """
+    for i in range(max(0, start_index), len(tokens)):
+        if looks_like_part_no(tokens[i]):
+            return i
+    return -1
+
+
+def find_maker_index(tokens: list, start_index: int = 0) -> int:
+    """
+    Find first maker-like token at or after start_index.
+    """
+    for i in range(max(0, start_index), len(tokens)):
+        if looks_like_maker_text(tokens[i]):
+            return i
+    return -1
+
+
+def join_name_tokens(name_tokens: list) -> str:
+    """
+    Join part name fragments.
+    """
+    clean = [safe_text(t) for t in name_tokens if safe_text(t)]
+    return " ".join(clean).strip()
+
+
+def parse_general_bom_true_row(row: pd.Series) -> dict:
+    """
+    Parse a normal BOM_TRUE row into BOM_RAW columns.
+
+    Expected target schema:
+    - ITEM_NO
+    - PART_NAME
+    - QTY
+    - PART_NO
+    - MAKER
+    """
+    tokens = row_text_tokens(row)
+    tokens = [safe_text(t) for t in tokens if safe_text(t)]
+
+    item_no = first_item_no_from_tokens_or_row(row, tokens)
+
+    parse_confidence = 0
+    reasons = []
+
+    if item_no:
+        parse_confidence += 25
+        reasons.append("ITEM_NO_FOUND")
+
+    working_tokens = tokens.copy()
+
+    # If first token is item number, exclude it from name search area.
+    if working_tokens and item_no and safe_text(working_tokens[0]) == safe_text(item_no):
+        body_tokens = working_tokens[1:]
+        body_offset = 1
+    else:
+        body_tokens = working_tokens
+        body_offset = 0
+
+    qty_idx_body = find_qty_index(body_tokens)
+    qty = ""
+
+    if qty_idx_body >= 0:
+        qty = safe_text(body_tokens[qty_idx_body])
+        qty_idx = qty_idx_body + body_offset
+        parse_confidence += 15
+        reasons.append("QTY_FOUND")
+    else:
+        qty_idx = -1
+
+    # Part number usually appears after qty.
+    search_start_body = qty_idx_body + 1 if qty_idx_body >= 0 else 0
+    part_idx_body = find_part_no_index(body_tokens, start_index=search_start_body)
+
+    if part_idx_body < 0:
+        # Fallback: search entire body.
+        part_idx_body = find_part_no_index(body_tokens, start_index=0)
+
+    part_no = ""
+
+    if part_idx_body >= 0:
+        part_no = normalize_part_no_basic(body_tokens[part_idx_body])
+        part_idx = part_idx_body + body_offset
+        parse_confidence += 25
+        reasons.append("PART_NO_FOUND")
+    else:
+        part_idx = -1
+
+    maker_idx_body = find_maker_index(
+        body_tokens,
+        start_index=(part_idx_body + 1 if part_idx_body >= 0 else 0)
+    )
+
+    maker = ""
+
+    if maker_idx_body >= 0:
+        maker = normalize_maker_basic(body_tokens[maker_idx_body])
+        maker_idx = maker_idx_body + body_offset
+        parse_confidence += 15
+        reasons.append("MAKER_FOUND")
+    else:
+        maker_idx = -1
+
+    # Determine part name.
+    if qty_idx_body > 0:
+        name_tokens = body_tokens[:qty_idx_body]
+    elif part_idx_body > 0:
+        name_tokens = body_tokens[:part_idx_body]
+    else:
+        # If no qty/part no found, use early non-code tokens as review candidate.
+        name_tokens = []
+        for t in body_tokens:
+            if looks_like_qty(t) or looks_like_part_no(t) or looks_like_maker_text(t):
+                continue
+            name_tokens.append(t)
+
+    part_name = join_name_tokens(name_tokens)
+
+    if part_name:
+        parse_confidence += 15
+        reasons.append("PART_NAME_FOUND")
+
+    # Additional confidence from source reconstruction method.
+    if bool(row.get("FRAGMENT_MERGE_FLAG", False)):
+        parse_confidence += 5
+        reasons.append("FRAGMENT_MERGE_SOURCE")
+
+    if bool(row.get("ROWSPAN_EXPANDED", False)):
+        parse_confidence += 5
+        reasons.append("ROWSPAN_SOURCE")
+
+    parse_confidence = min(100, parse_confidence)
+
+    review_flag = parse_confidence < BOM_RAW_PARSE_CONFIDENCE_TRUE
+
+    # Conservative fallback: If maker is missing but item/name/qty/part_no exist,
+    # allow as parsed but mark review.
+    if item_no and part_name and qty and part_no and not maker:
+        reasons.append("MAKER_MISSING_REVIEW")
+        review_flag = True
+
+    # If part_no is missing, it must be reviewed.
+    if not part_no:
+        reasons.append("PART_NO_MISSING_REVIEW")
+        review_flag = True
+
+    return {
+        "DRAWING_FILE": safe_text(row.get("DRAWING_FILE", "")),
+        "PAGE_OR_LAYOUT": safe_text(row.get("PAGE_OR_LAYOUT", "")),
+        "ITEM_NO": item_no,
+        "PART_NAME": part_name,
+        "QTY": qty,
+        "PART_NO": part_no,
+        "MAKER": maker,
+        "SOURCE_ROW_ID": safe_text(row.get("ROW_ID", "")),
+        "SOURCE_RAW_ROW_TEXT": safe_text(row.get("RAW_ROW_TEXT", "")),
+        "SOURCE_SEGMENT_METHOD": safe_text(row.get("SEGMENT_METHOD", "")),
+        "BOM_ZONE_ID": safe_text(row.get("BOM_ZONE_ID", "")),
+        "BOM_ZONE_CONFIDENCE": row.get("BOM_ZONE_CONFIDENCE", None),
+        "BOM_JUDGE_SCORE": row.get("BOM_JUDGE_SCORE", None),
+        "BOM_JUDGE_REASON": safe_text(row.get("BOM_JUDGE_REASON", "")),
+        "PARSE_METHOD": "GENERAL_BOM_TRUE_ROW_PARSE",
+        "PARSE_CONFIDENCE": parse_confidence,
+        "PARSE_REASON": "; ".join(reasons) if reasons else "NO_PARSE_SIGNAL",
+        "PARSE_REVIEW_FLAG": bool(review_flag),
+    }
+
+
+def build_bom_raw_from_true_rows(bom_true_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Build BOM_RAW from BOM_TRUE_ROWS.
+    """
+    columns = [
+        "DRAWING_FILE", "PAGE_OR_LAYOUT",
+        "ITEM_NO", "PART_NAME", "QTY", "PART_NO", "MAKER",
+        "SOURCE_ROW_ID", "SOURCE_RAW_ROW_TEXT", "SOURCE_SEGMENT_METHOD",
+        "BOM_ZONE_ID", "BOM_ZONE_CONFIDENCE",
+        "BOM_JUDGE_SCORE", "BOM_JUDGE_REASON",
+        "PARSE_METHOD", "PARSE_CONFIDENCE", "PARSE_REASON", "PARSE_REVIEW_FLAG"
+    ]
+
+    if bom_true_df is None or bom_true_df.empty:
+        return pd.DataFrame(columns=columns)
+
+    records = []
+
+    for _, row in bom_true_df.iterrows():
+        if is_root_bom_true_row(row):
+            records.append(parse_root_row_to_bom_raw(row))
+        else:
+            records.append(parse_general_bom_true_row(row))
+
+    out = pd.DataFrame(records)
+
+    for col in columns:
+        if col not in out.columns:
+            out[col] = None
+
+    out = out[columns]
+
+    # Clean numeric qty where possible but keep as text-compatible.
+    if not out.empty:
+        out["QTY"] = out["QTY"].map(lambda x: safe_text(x))
+        out["PART_NO"] = out["PART_NO"].map(normalize_part_no_basic)
+        out["MAKER"] = out["MAKER"].map(normalize_maker_basic)
+
+    return out.reset_index(drop=True)
+
+
+def split_bom_raw_parse_review(bom_raw_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Return rows needing parse review.
+    """
+    if bom_raw_df is None or bom_raw_df.empty:
+        return pd.DataFrame()
+
+    if "PARSE_REVIEW_FLAG" not in bom_raw_df.columns:
+        return pd.DataFrame()
+
+    return bom_raw_df[bom_raw_df["PARSE_REVIEW_FLAG"].fillna(False).astype(bool)].copy().reset_index(drop=True)
+
+
+
+# ============================================================
+# Step 7: PART_MASTER generation - Step 6
+# ============================================================
+
+def normalize_part_no_for_master(part_no: str) -> str:
+    """
+    Normalize PART_NO for master grouping.
+
+    Conservative rule:
+    - trim
+    - remove spaces
+    - uppercase
+    - keep hyphen/underscore/dot because they may be meaningful
+    """
+    value = normalize_part_no_basic(part_no)
+    value = safe_text(value).upper()
+    value = value.replace(" ", "")
+    return value
+
+
+def normalize_name_for_compare(name: str) -> str:
+    """
+    Normalize part name for duplicate comparison.
+    """
+    value = safe_text(name).upper()
+    value = re.sub(r"\s+", " ", value)
+    return value.strip()
+
+
+def normalize_maker_for_compare(maker: str) -> str:
+    """
+    Normalize maker for duplicate comparison.
+    """
+    value = safe_text(maker).upper()
+    value = re.sub(r"\s+", " ", value)
+    return value.strip()
+
+
+def qty_to_number(value):
+    """
+    Convert QTY to numeric if possible.
+    """
+    text = safe_text(value)
+    if not text:
+        return 0
+    try:
+        return float(text)
+    except Exception:
+        return 0
+
+
+def choose_representative_value(series: pd.Series) -> str:
+    """
+    Choose the most frequent non-empty value.
+    """
+    values = [safe_text(v) for v in series.tolist() if safe_text(v)]
+
+    if not values:
+        return ""
+
+    counts = {}
+    first_order = {}
+
+    for i, v in enumerate(values):
+        key = v
+        counts[key] = counts.get(key, 0) + 1
+        if key not in first_order:
+            first_order[key] = i
+
+    sorted_values = sorted(values, key=lambda x: (-counts[x], first_order[x]))
+    return sorted_values[0]
+
+
+def unique_join(series: pd.Series, limit: int = 50) -> str:
+    """
+    Join unique non-empty values.
+    """
+    values = []
+    seen = set()
+
+    for v in series.tolist():
+        text = safe_text(v)
+        if not text:
+            continue
+        if text in seen:
+            continue
+        seen.add(text)
+        values.append(text)
+        if len(values) >= limit:
+            break
+
+    return "; ".join(values)
+
+
+def build_part_master_from_bom_raw(bom_raw_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Build PART_MASTER using PART_NO as the key.
+
+    PART_MASTER is intentionally simple in Step 6:
+    - one row per normalized PART_NO
+    - representative name/maker
+    - total quantity
+    - source drawings
+    - flags for ROOT and parse review
+    """
+    columns = [
+        "PART_NO",
+        "PART_NO_NORMALIZED",
+        "PART_NAME_REPRESENTATIVE",
+        "MAKER_REPRESENTATIVE",
+        "TOTAL_QTY",
+        "ROW_COUNT",
+        "SOURCE_DRAWING_COUNT",
+        "SOURCE_DRAWINGS",
+        "SOURCE_LAYOUTS",
+        "ITEM_NOS",
+        "IS_ROOT_PART",
+        "HAS_PARSE_REVIEW",
+        "PARSE_CONFIDENCE_MIN",
+        "PARSE_CONFIDENCE_MAX",
+        "BOM_ZONE_IDS",
+        "SOURCE_ROW_IDS",
+    ]
+
+    if bom_raw_df is None or bom_raw_df.empty:
+        return pd.DataFrame(columns=columns)
+
+    df = bom_raw_df.copy()
+
+    for col in ["PART_NO", "PART_NAME", "MAKER", "QTY", "DRAWING_FILE", "PAGE_OR_LAYOUT", "ITEM_NO"]:
+        if col not in df.columns:
+            df[col] = ""
+
+    df["PART_NO_NORMALIZED"] = df["PART_NO"].map(normalize_part_no_for_master)
+
+    df_valid = df[df["PART_NO_NORMALIZED"] != ""].copy()
+
+    if df_valid.empty:
+        return pd.DataFrame(columns=columns)
+
+    records = []
+
+    for part_no_norm, g in df_valid.groupby("PART_NO_NORMALIZED", dropna=False):
+        total_qty = sum(qty_to_number(v) for v in g["QTY"].tolist())
+
+        parse_conf = pd.to_numeric(g.get("PARSE_CONFIDENCE"), errors="coerce")
+        parse_conf_valid = parse_conf[parse_conf.notna()]
+
+        is_root = False
+        if "PARSE_METHOD" in g.columns:
+            is_root = bool((g["PARSE_METHOD"].astype(str) == "ROOT_DRAWING_SELF").any())
+        if not is_root and "MAKER" in g.columns:
+            is_root = bool((g["MAKER"].astype(str) == "DRAWING_SELF").any())
+
+        has_parse_review = False
+        if "PARSE_REVIEW_FLAG" in g.columns:
+            has_parse_review = bool(g["PARSE_REVIEW_FLAG"].fillna(False).astype(bool).any())
+
+        records.append({
+            "PART_NO": choose_representative_value(g["PART_NO"]),
+            "PART_NO_NORMALIZED": part_no_norm,
+            "PART_NAME_REPRESENTATIVE": choose_representative_value(g["PART_NAME"]),
+            "MAKER_REPRESENTATIVE": choose_representative_value(g["MAKER"]),
+            "TOTAL_QTY": total_qty,
+            "ROW_COUNT": len(g),
+            "SOURCE_DRAWING_COUNT": g["DRAWING_FILE"].dropna().astype(str).nunique(),
+            "SOURCE_DRAWINGS": unique_join(g["DRAWING_FILE"]),
+            "SOURCE_LAYOUTS": unique_join(g["PAGE_OR_LAYOUT"]),
+            "ITEM_NOS": unique_join(g["ITEM_NO"]),
+            "IS_ROOT_PART": is_root,
+            "HAS_PARSE_REVIEW": has_parse_review,
+            "PARSE_CONFIDENCE_MIN": float(parse_conf_valid.min()) if not parse_conf_valid.empty else None,
+            "PARSE_CONFIDENCE_MAX": float(parse_conf_valid.max()) if not parse_conf_valid.empty else None,
+            "BOM_ZONE_IDS": unique_join(g["BOM_ZONE_ID"]) if "BOM_ZONE_ID" in g.columns else "",
+            "SOURCE_ROW_IDS": unique_join(g["SOURCE_ROW_ID"]) if "SOURCE_ROW_ID" in g.columns else "",
+        })
+
+    out = pd.DataFrame(records)
+
+    if out.empty:
+        return pd.DataFrame(columns=columns)
+
+    out = out[columns].sort_values(
+        by=["IS_ROOT_PART", "PART_NO_NORMALIZED"],
+        ascending=[False, True]
+    ).reset_index(drop=True)
+
+    return out
+
+
+def build_missing_part_no_rows(bom_raw_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Rows in BOM_RAW with missing PART_NO.
+
+    These must be reviewed before PART_MASTER is trusted.
+    """
+    if bom_raw_df is None or bom_raw_df.empty:
+        return pd.DataFrame()
+
+    df = bom_raw_df.copy()
+
+    if "PART_NO" not in df.columns:
+        df["PART_NO"] = ""
+
+    df["PART_NO_NORMALIZED"] = df["PART_NO"].map(normalize_part_no_for_master)
+    missing = df[df["PART_NO_NORMALIZED"] == ""].copy()
+
+    return missing.reset_index(drop=True)
+
+
+def build_duplicate_parts_report(bom_raw_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Detect inconsistent names or makers for the same normalized PART_NO.
+
+    This is not deduplication removal. It is a quality-control report.
+    """
+    columns = [
+        "PART_NO_NORMALIZED",
+        "ROW_COUNT",
+        "PART_NAME_VARIANT_COUNT",
+        "MAKER_VARIANT_COUNT",
+        "PART_NAME_VARIANTS",
+        "MAKER_VARIANTS",
+        "SOURCE_DRAWINGS",
+        "SOURCE_ROW_IDS",
+        "DUPLICATE_REASON"
+    ]
+
+    if bom_raw_df is None or bom_raw_df.empty:
+        return pd.DataFrame(columns=columns)
+
+    df = bom_raw_df.copy()
+
+    for col in ["PART_NO", "PART_NAME", "MAKER", "DRAWING_FILE", "SOURCE_ROW_ID"]:
+        if col not in df.columns:
+            df[col] = ""
+
+    df["PART_NO_NORMALIZED"] = df["PART_NO"].map(normalize_part_no_for_master)
+    df = df[df["PART_NO_NORMALIZED"] != ""].copy()
+
+    if df.empty:
+        return pd.DataFrame(columns=columns)
+
+    records = []
+
+    for part_no_norm, g in df.groupby("PART_NO_NORMALIZED", dropna=False):
+        name_variants = sorted(set(
+            normalize_name_for_compare(v)
+            for v in g["PART_NAME"].tolist()
+            if normalize_name_for_compare(v)
+        ))
+
+        maker_variants = sorted(set(
+            normalize_maker_for_compare(v)
+            for v in g["MAKER"].tolist()
+            if normalize_maker_for_compare(v)
+        ))
+
+        reasons = []
+
+        if len(name_variants) > 1:
+            reasons.append("PART_NAME_VARIANTS")
+
+        if len(maker_variants) > 1:
+            reasons.append("MAKER_VARIANTS")
+
+        if not reasons:
+            continue
+
+        records.append({
+            "PART_NO_NORMALIZED": part_no_norm,
+            "ROW_COUNT": len(g),
+            "PART_NAME_VARIANT_COUNT": len(name_variants),
+            "MAKER_VARIANT_COUNT": len(maker_variants),
+            "PART_NAME_VARIANTS": "; ".join(name_variants),
+            "MAKER_VARIANTS": "; ".join(maker_variants),
+            "SOURCE_DRAWINGS": unique_join(g["DRAWING_FILE"]),
+            "SOURCE_ROW_IDS": unique_join(g["SOURCE_ROW_ID"]),
+            "DUPLICATE_REASON": "; ".join(reasons),
+        })
+
+    if not records:
+        return pd.DataFrame(columns=columns)
+
+    return pd.DataFrame(records, columns=columns).sort_values(
+        by=["PART_NO_NORMALIZED"]
+    ).reset_index(drop=True)
+
+
+def build_part_master_quality_summary(
+    part_master_df: pd.DataFrame,
+    missing_part_no_df: pd.DataFrame,
+    duplicate_parts_df: pd.DataFrame
+) -> pd.DataFrame:
+    """
+    Small quality summary for PART_MASTER stage.
+    """
+    root_count = 0
+    review_count = 0
+
+    if part_master_df is not None and not part_master_df.empty:
+        if "IS_ROOT_PART" in part_master_df.columns:
+            root_count = int(part_master_df["IS_ROOT_PART"].fillna(False).astype(bool).sum())
+        if "HAS_PARSE_REVIEW" in part_master_df.columns:
+            review_count = int(part_master_df["HAS_PARSE_REVIEW"].fillna(False).astype(bool).sum())
+
+    return pd.DataFrame([
+        {"KEY": "PART_MASTER_ROW_COUNT", "VALUE": len(part_master_df) if part_master_df is not None else 0},
+        {"KEY": "ROOT_PART_COUNT", "VALUE": root_count},
+        {"KEY": "PART_MASTER_WITH_PARSE_REVIEW_COUNT", "VALUE": review_count},
+        {"KEY": "MISSING_PART_NO_ROW_COUNT", "VALUE": len(missing_part_no_df) if missing_part_no_df is not None else 0},
+        {"KEY": "DUPLICATE_PARTS_ROW_COUNT", "VALUE": len(duplicate_parts_df) if duplicate_parts_df is not None else 0},
+    ])
+
+
+def export_step1_excel(
+    output_path: Path,
+    file_df: pd.DataFrame,
+    text_df: pd.DataFrame,
+    row_candidate_df: pd.DataFrame,
+    bom_zone_df: pd.DataFrame,
+) -> None:
+    row_diag_df = build_row_candidate_diagnostics(text_df, row_candidate_df)
+    bom_zone_row_summary_df = build_bom_zone_row_summary(row_candidate_df, bom_zone_df)
+    inside_zone_rows_df, outside_zone_rows_df, root_rows_df = split_rows_by_bom_zone_membership(row_candidate_df)
+    outside_zone_summary_df = build_outside_zone_debug_summary(outside_zone_rows_df)
+    header_anchor_candidates_df = build_header_anchor_candidates_sheet(text_df)
+
+    bom_judged_df = build_zone_gated_bom_judgment(row_candidate_df)
+    bom_true_df, bom_review_df, bom_false_df = split_bom_judged_rows(bom_judged_df)
+    bom_raw_df = build_bom_raw_from_true_rows(bom_true_df)
+    bom_raw_parse_review_df = split_bom_raw_parse_review(bom_raw_df)
+    part_master_df = build_part_master_from_bom_raw(bom_raw_df)
+    missing_part_no_df = build_missing_part_no_rows(bom_raw_df)
+    duplicate_parts_df = build_duplicate_parts_report(bom_raw_df)
+    part_master_quality_summary_df = build_part_master_quality_summary(
+        part_master_df,
+        missing_part_no_df,
+        duplicate_parts_df
+    )
+
+    summary = pd.DataFrame([
+        {"KEY": "RUN_TIME", "VALUE": datetime.now().strftime("%Y-%m-%d %H:%M:%S")},
+        {"KEY": "MODE", "VALUE": "CLEAN_RESTART_STEP6_PART_MASTER"},
+        {"KEY": "DRAWING_FILE_COUNT", "VALUE": len(file_df) if file_df is not None else 0},
+        {"KEY": "TEXT_OBJECT_RAW_COUNT", "VALUE": len(text_df) if text_df is not None else 0},
+        {"KEY": "TEXT_OBJECT_OK_COUNT", "VALUE": int((text_df["EXTRACTION_STATUS"] == "OK").sum()) if text_df is not None and not text_df.empty and "EXTRACTION_STATUS" in text_df.columns else 0},
+        {"KEY": "ROW_CANDIDATE_COUNT", "VALUE": len(row_candidate_df) if row_candidate_df is not None else 0},
+        {"KEY": "BOM_ZONE_CANDIDATE_COUNT", "VALUE": len(bom_zone_df) if bom_zone_df is not None else 0},
+        {"KEY": "ROW_IN_BOM_ZONE_COUNT", "VALUE": int(row_candidate_df["IS_IN_BOM_ZONE"].fillna(False).astype(bool).sum()) if row_candidate_df is not None and not row_candidate_df.empty and "IS_IN_BOM_ZONE" in row_candidate_df.columns else 0},
+        {"KEY": "INSIDE_BOM_ZONE_ROW_COUNT", "VALUE": len(inside_zone_rows_df)},
+        {"KEY": "OUTSIDE_BOM_ZONE_ROW_COUNT", "VALUE": len(outside_zone_rows_df)},
+        {"KEY": "ROOT_ROW_COUNT", "VALUE": len(root_rows_df)},
+        {"KEY": "BOM_JUDGED_ROW_COUNT", "VALUE": len(bom_judged_df)},
+        {"KEY": "BOM_TRUE_ROW_COUNT", "VALUE": len(bom_true_df)},
+        {"KEY": "BOM_REVIEW_ROW_COUNT", "VALUE": len(bom_review_df)},
+        {"KEY": "BOM_FALSE_ROW_COUNT", "VALUE": len(bom_false_df)},
+        {"KEY": "BOM_RAW_ROW_COUNT", "VALUE": len(bom_raw_df)},
+        {"KEY": "BOM_RAW_PARSE_REVIEW_COUNT", "VALUE": len(bom_raw_parse_review_df)},
+        {"KEY": "PART_MASTER_ROW_COUNT", "VALUE": len(part_master_df)},
+        {"KEY": "MISSING_PART_NO_ROW_COUNT", "VALUE": len(missing_part_no_df)},
+        {"KEY": "DUPLICATE_PARTS_ROW_COUNT", "VALUE": len(duplicate_parts_df)},
+        {"KEY": "NOTE", "VALUE": "Step 1~6. PART_MASTER generated from BOM_RAW by PART_NO."},
+    ])
+
+    with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
+        summary.to_excel(writer, index=False, sheet_name="SUMMARY")
+        file_df.to_excel(writer, index=False, sheet_name="DRAWING_FILE_LIST")
+        text_df.to_excel(writer, index=False, sheet_name="TEXT_OBJECT_RAW")
+        row_candidate_df.to_excel(writer, index=False, sheet_name="ROW_CANDIDATES")
+        bom_judged_df.to_excel(writer, index=False, sheet_name="BOM_JUDGED_ROWS")
+        bom_true_df.to_excel(writer, index=False, sheet_name="BOM_TRUE_ROWS")
+        bom_review_df.to_excel(writer, index=False, sheet_name="BOM_REVIEW_ROWS")
+        bom_false_df.to_excel(writer, index=False, sheet_name="BOM_FALSE_ROWS")
+        bom_raw_df.to_excel(writer, index=False, sheet_name="BOM_RAW")
+        bom_raw_parse_review_df.to_excel(writer, index=False, sheet_name="BOM_RAW_PARSE_REVIEW")
+        part_master_df.to_excel(writer, index=False, sheet_name="PART_MASTER")
+        missing_part_no_df.to_excel(writer, index=False, sheet_name="MISSING_PART_NO")
+        duplicate_parts_df.to_excel(writer, index=False, sheet_name="DUPLICATE_PARTS")
+        part_master_quality_summary_df.to_excel(writer, index=False, sheet_name="PART_MASTER_SUMMARY")
+        bom_zone_df.to_excel(writer, index=False, sheet_name="BOM_ZONE_CANDIDATES")
+        bom_zone_row_summary_df.to_excel(writer, index=False, sheet_name="BOM_ZONE_ROW_SUMMARY")
+        inside_zone_rows_df.to_excel(writer, index=False, sheet_name="INSIDE_BOM_ZONE_ROWS")
+        outside_zone_rows_df.to_excel(writer, index=False, sheet_name="OUTSIDE_BOM_ZONE_ROWS")
+        outside_zone_summary_df.to_excel(writer, index=False, sheet_name="OUTSIDE_ZONE_SUMMARY")
+        root_rows_df.to_excel(writer, index=False, sheet_name="ROOT_ROWS")
+        header_anchor_candidates_df.to_excel(writer, index=False, sheet_name="HEADER_ANCHOR_CANDIDATES")
+        row_diag_df.to_excel(writer, index=False, sheet_name="ROW_DIAGNOSTICS")
+
+    print("-" * 80)
+    print(f"[OK] Excel saved: {output_path}")
+    print("-" * 80)
+
+
+# ============================================================
+# Main
+# ============================================================
+
+def main():
+    try:
+        input_folder = ask_input_folder()
+
+        print("-" * 80)
+        print(f"[INFO] Selected folder: {input_folder}")
+
+        print("[INFO] Collecting DWG/PDF files...")
+        file_df = collect_drawing_files(input_folder, recursive=False)
+
+        if file_df.empty:
+            print("[WARN] No DWG/PDF files found.")
+            return
+
+        print(f"[INFO] Drawing file count: {len(file_df)}")
+
+        print("-" * 80)
+        print("[INFO] Extracting TEXT_OBJECT_RAW...")
+        text_df = extract_text_objects_from_files(file_df)
+        print(f"[INFO] TEXT_OBJECT_RAW count: {len(text_df)}")
+
+        print("-" * 80)
+        print("[INFO] Building ROW_CANDIDATES...")
+        row_candidate_df = build_row_candidates(text_df)
+
+        print("[INFO] Adding de-duplicated ROOT rows...")
+        row_candidate_df = add_drawing_self_root_rows(file_df, row_candidate_df)
+        print(f"[INFO] ROW_CANDIDATES count: {len(row_candidate_df)}")
+
+        print("-" * 80)
+        print("[INFO] Building BOM_ZONE_CANDIDATES - Step 1 header anchor + Step 2 headerless extension...")
+        bom_zone_df = build_bom_zone_candidates(text_df, row_candidate_df)
+        print(f"[INFO] BOM_ZONE_CANDIDATES count: {len(bom_zone_df)}")
+
+        print("[INFO] Assigning IS_IN_BOM_ZONE to ROW_CANDIDATES...")
+        row_candidate_df = assign_bom_zone_to_row_candidates(row_candidate_df, bom_zone_df)
+        in_zone_count = int(row_candidate_df["IS_IN_BOM_ZONE"].fillna(False).astype(bool).sum()) if "IS_IN_BOM_ZONE" in row_candidate_df.columns else 0
+        print(f"[INFO] ROW_CANDIDATES in BOM zone count: {in_zone_count}")
+
+        preview_judged_df = build_zone_gated_bom_judgment(row_candidate_df)
+        preview_true_df, preview_review_df, preview_false_df = split_bom_judged_rows(preview_judged_df)
+        preview_bom_raw_df = build_bom_raw_from_true_rows(preview_true_df)
+        preview_bom_raw_review_df = split_bom_raw_parse_review(preview_bom_raw_df)
+        preview_part_master_df = build_part_master_from_bom_raw(preview_bom_raw_df)
+        preview_missing_part_no_df = build_missing_part_no_rows(preview_bom_raw_df)
+        preview_duplicate_parts_df = build_duplicate_parts_report(preview_bom_raw_df)
+        print(f"[INFO] BOM_TRUE_ROWS preview count: {len(preview_true_df)}")
+        print(f"[INFO] BOM_REVIEW_ROWS preview count: {len(preview_review_df)}")
+        print(f"[INFO] BOM_FALSE_ROWS preview count: {len(preview_false_df)}")
+        print(f"[INFO] BOM_RAW preview count: {len(preview_bom_raw_df)}")
+        print(f"[INFO] BOM_RAW_PARSE_REVIEW preview count: {len(preview_bom_raw_review_df)}")
+        print(f"[INFO] PART_MASTER preview count: {len(preview_part_master_df)}")
+        print(f"[INFO] MISSING_PART_NO preview count: {len(preview_missing_part_no_df)}")
+        print(f"[INFO] DUPLICATE_PARTS preview count: {len(preview_duplicate_parts_df)}")
+
+        output_path = input_folder / OUTPUT_EXCEL_NAME
+        export_step1_excel(output_path, file_df, text_df, row_candidate_df, bom_zone_df)
+
+        print("[DONE] Step 1~6 completed.")
+        print("[NEXT] Review PART_MASTER, MISSING_PART_NO, and DUPLICATE_PARTS quality sheets.")
+
+    except KeyboardInterrupt:
+        print("\n[STOP] User cancelled.")
+
+    except Exception as exc:
+        print("[FATAL ERROR]")
+        print(f"{type(exc).__name__}: {exc}")
+        print(traceback.format_exc())
+
+
+if __name__ == "__main__":
+    main()
